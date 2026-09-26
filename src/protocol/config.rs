@@ -19,6 +19,7 @@ pub struct FramerConfig {
 }
 
 const MIN_HEADER_LEN: u8 = 13;
+const RESERVED_SUFFIX: u8 = 12;
 impl FramerConfig {
     pub fn validate(&self) -> Result<(), ()> {
         if self.header_length < MIN_HEADER_LEN {
@@ -29,7 +30,7 @@ impl FramerConfig {
             return Err(());
         }
         for item in poses {
-            if poses.iter().filter(|&&x| x == item).count() > 1 || item >= (self.header_length - 8) {
+            if poses.iter().filter(|&&x| x == item).count() > 1 || item >= (self.header_length - RESERVED_SUFFIX) {
                 return Err(());
             }
         }
@@ -44,7 +45,7 @@ impl FramerConfig {
             }
         }
 
-        if self.request_opcode_code.is_empty() || self.response_opcode_code.is_empty() {return Err(())}
+        if self.request_opcode_code.is_empty() || self.response_opcode_code.is_empty() || self.request_opcode_code.iter().all(|o| o.is_none()) {return Err(())}
 
         Ok(())
     }
