@@ -18,8 +18,8 @@ pub struct FramerConfig {
     pub header_length: u8,
 }
 
-const MIN_HEADER_LEN: u8 = 13;
-const RESERVED_SUFFIX: u8 = 12;
+pub const MIN_HEADER_LEN: u8 = 13;
+pub const RESERVED_SUFFIX: u8 = 12;
 impl FramerConfig {
     pub fn validate(&self) -> Result<(), ()> {
         if self.header_length < MIN_HEADER_LEN {
