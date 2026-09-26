@@ -1,11 +1,21 @@
 pub(crate) use crate::protocol::commands::{ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders, ResponseOpcode};
 use crate::protocol::config::FramerConfig;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 #[derive(Clone, Debug)]
 pub struct Framer {
     pub config: FramerConfig,
+    cached_header: Option<RequestHeaders>,
+}
+
+impl Framer {
+    pub fn new(cfg: FramerConfig) -> Self {
+        Self{
+            config: cfg,
+            cached_header: None,
+        }
+    }
 }
 
 impl Encoder<Response> for Framer {
@@ -57,10 +67,15 @@ impl Decoder for Framer {
 
         let mut headers: RequestHeaders;
 
-        headers = match decode_headers(&src[..self.config.header_length as usize], &self.config) {
-            Ok(value) => value,
-            Err(e) => {
-                return Err(e);
+        headers = match &self.cached_header {
+            Some(val) => val.clone(),
+            None => {
+                match decode_headers(&src[..self.config.header_length as usize], &self.config) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
             }
         };
 
@@ -79,7 +94,10 @@ impl Decoder for Framer {
         let frame_len = (self.config.header_length as usize).checked_add(body_len).ok_or(ProtocolError::InvalidFrame("Frame length overflow"))?;
 
         if src.len() < frame_len {
+            self.cached_header = Some(headers);
             return Ok(None);
+        } else {
+            self.cached_header = None;
         }
 
         let _hdr = src.split_to(self.config.header_length as usize);
@@ -182,17 +200,8 @@ fn decode_options(
         if raw.len() < MIN_OPTION_LENGTH {
             return Err(ProtocolError::InvalidFrame("Invalid options format"));
         }
-        let key_count_bytes: [u8; 2] = match raw.split_to(2).to_vec().try_into() {
-            Ok(value) => value,
-            Err(_) => return Err(ProtocolError::InvalidFrame("Invalid options format")),
-        };
-        let key_count: u16 = u16::from_be_bytes(key_count_bytes);
-
-        let value_count_bytes: [u8; 2] = match raw.split_to(2).to_vec().try_into() {
-            Ok(value) => value,
-            Err(_) => return Err(ProtocolError::InvalidFrame("Invalid options format")),
-        };
-        let value_count: u16 = u16::from_be_bytes(value_count_bytes);
+        let key_count: u16 = raw.get_u16();
+        let value_count: u16 = raw.get_u16();
 
         let key: String;
         let value: String;
@@ -203,26 +212,14 @@ fn decode_options(
 
         if config.options_key_first {
             let key_bytes = raw.split_to(key_count as usize);
-            key = match String::from_utf8(key_bytes.to_vec()) {
-                Ok(value) => value,
-                Err(_) => return Err(ProtocolError::InvalidFrame("Invalid options format")),
-            };
+            key = String::from_utf8(key_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
             let value_bytes = raw.split_to(value_count as usize);
-            value = match String::from_utf8(value_bytes.to_vec()) {
-                Ok(value) => value,
-                Err(_) => return Err(ProtocolError::InvalidFrame("Invalid options format")),
-            }
+            value = String::from_utf8(value_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
         } else {
             let value_bytes = raw.split_to(value_count as usize);
-            value = match String::from_utf8(value_bytes.to_vec()) {
-                Ok(value) => value,
-                Err(_) => return Err(ProtocolError::InvalidFrame("Invalid options format")),
-            };
+            value = String::from_utf8(value_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
             let key_bytes = raw.split_to(key_count as usize);
-            key = match String::from_utf8(key_bytes.to_vec()) {
-                Ok(value) => value,
-                Err(_) => return Err(ProtocolError::InvalidFrame("Invalid options format")),
-            };
+            key = String::from_utf8(key_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
         }
         options.push((key, value));
     }
@@ -244,14 +241,14 @@ fn encode_headers(headers: &ResponseHeaders, options_count: u8, options_len: u32
         }
     };
 
-    let mut big_bytes: [u8; 8] = [0; 8];
-    big_bytes[0..4].copy_from_slice(&(options_len.to_be_bytes()));
-    big_bytes[4..8].copy_from_slice(&(payload_len.to_be_bytes()));
+    let hlen = config.header_length as usize;
 
     bytes[(config.version_pos - 1) as usize] = headers.version;
     bytes[(config.opcode_pos - 1) as usize] = opcode_bytes;
     bytes[(config.options_count_pos - 1) as usize] = options_count;
-    bytes[4..12].copy_from_slice(&big_bytes);
+    bytes[hlen - 12..hlen - 8].copy_from_slice(&options_len.to_be_bytes());
+    bytes[hlen - 8..hlen - 4].copy_from_slice(&payload_len.to_be_bytes());
+    bytes[hlen - 4..hlen].copy_from_slice(&headers.req_id.to_be_bytes());
 
     Ok(bytes)
 }
@@ -264,11 +261,14 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
     let opcode: RequestOpcode;
     match bytes.get((config.opcode_pos - 1) as usize) {
         Some(&value) => {
-            opcode = config
+            opcode = match config
                 .request_opcode_code
-                .get(&value)
+                .get(value as usize)
                 .cloned()
-                .ok_or(ProtocolError::InvalidFrame("Invalid opcode"))?
+                .ok_or(ProtocolError::InvalidFrame("Invalid opcode"))? {
+                Some(value) => value,
+                None => return Err(ProtocolError::InvalidFrame("Invalid opcode")),
+            }
         }
         None => {
             return Err(ProtocolError::InvalidFrame("Opcode not found"));
@@ -306,43 +306,12 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
             return Err(ProtocolError::InvalidFrame("Route length not found"));
         }
     }
-    let payload_len: u32;
 
-    let big_bytes = &bytes[bytes.len() - 8..];
-    let payload_bytes = big_bytes.get(4..8);
-    match payload_bytes {
-        Some(value) => match value.try_into() {
-            Ok(array) => {
-                payload_len = u32::from_be_bytes(array);
-            }
-            Err(_) => {
-                return Err(ProtocolError::InvalidFrame(
-                    "Payload length slice is not 4 bytes",
-                ));
-            }
-        },
-        None => {
-            return Err(ProtocolError::InvalidFrame("Payload length not found"));
-        }
-    }
+    let mut big_bytes = &bytes[bytes.len() - 12..];
 
-    let option_len: u32;
-    let option_bytes = big_bytes.get(0..4);
-    match option_bytes {
-        Some(value) => match value.try_into() {
-            Ok(array) => {
-                option_len = u32::from_be_bytes(array);
-            }
-            Err(_) => {
-                return Err(ProtocolError::InvalidFrame(
-                    "Option length slice is not 4 bytes",
-                ));
-            }
-        },
-        None => {
-            return Err(ProtocolError::InvalidFrame("Payload length not found"));
-        }
-    }
+    let option_len = big_bytes.get_u32();
+    let payload_len = big_bytes.get_u32();
+    let req_id = big_bytes.get_u32();
 
     return Ok(RequestHeaders {
         payload_len: payload_len,
@@ -350,6 +319,7 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
         version: version,
         opcode: opcode,
         route_len: route_len,
+        req_id: req_id,
         options_len: option_len,
     });
 }

@@ -20,13 +20,13 @@ impl Router {
         self.routes.insert(route, handler);
     }
 
-    pub fn handle(&self, frame: Request) -> Response {
+    pub async fn handle(&self, frame: Request) -> Response {
         match self.routes.get(&frame.route) {
             Some(handler) => {
                 handler(frame)
             }
             None => {
-                Response{headers: ResponseHeaders{version: 1, opcode: ResponseOpcode::NotFound,}, payload: Bytes::from("No such method"), options: vec![]}
+                Response{headers: ResponseHeaders{version: 1, opcode: ResponseOpcode::NotFound, req_id: frame.headers.req_id}, payload: Bytes::from("No such method"), options: vec![]}
             }
         }
     }

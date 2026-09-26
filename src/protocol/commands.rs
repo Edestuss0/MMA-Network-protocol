@@ -18,9 +18,10 @@ pub struct RequestHeaders {
     pub route_len: u8,
     pub options_len: u32,
     pub options_count: u8,
+    pub req_id: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum RequestOpcode {
     Once,
     Channel,
@@ -44,6 +45,7 @@ pub enum ProtocolError {
 pub struct ResponseHeaders {
     pub opcode: ResponseOpcode,
     pub version: u8,
+    pub req_id: u32,
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]

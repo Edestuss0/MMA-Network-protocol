@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use crate::protocol::commands::{RequestOpcode, ResponseOpcode};
+use crate::protocol::framer::RequestOpcode::{Channel, Once};
 
 #[derive(Debug, Clone)]
 pub struct FramerConfig {
     pub max_message_length: u32,
-    pub request_opcode_code: HashMap<u8, RequestOpcode>,
+    pub request_opcode_code: [Option<RequestOpcode>; 256],
     pub response_opcode_code: HashMap<ResponseOpcode, u8>,
     pub opcode_pos: u8,
     pub version_pos: u8,
@@ -17,7 +18,7 @@ pub struct FramerConfig {
     pub header_length: u8,
 }
 
-const MIN_HEADER_LEN: u8 = 12;
+const MIN_HEADER_LEN: u8 = 13;
 impl FramerConfig {
     pub fn validate(&self) -> Result<(), ()> {
         if self.header_length < MIN_HEADER_LEN {
@@ -27,18 +28,16 @@ impl FramerConfig {
         if poses.contains(&0) {
             return Err(());
         }
+        for item in poses {
+            if poses.iter().filter(|&&x| x == item).count() > 1 || item >= (self.header_length - 8) {
+                return Err(());
+            }
+        }
 
         let orders = [self.payload_order, self.options_order, self.route_order];
         if orders.contains(&0) {
             return Err(());
         }
-
-        for item in poses {
-            if poses.iter().filter(|&&x| x == item).count() > 1 || item >= self.header_length {
-                return Err(());
-            }
-        }
-
         for item in orders {
             if orders.iter().filter(|&&x| x == item).count() > 1 || item > 3  {
                 return Err(());
@@ -50,8 +49,11 @@ impl FramerConfig {
         Ok(())
     }
     pub fn new() -> Self {
+        let mut req_opcodes = [None; 256];
+        req_opcodes[1] = Some(Channel);
+        req_opcodes[2] = Some(Once);
         Self {
-            request_opcode_code: HashMap::from([(1, RequestOpcode::Channel), (2, RequestOpcode::Once)]),
+            request_opcode_code: req_opcodes,
             response_opcode_code: HashMap::from([(ResponseOpcode::Ok, 1), (ResponseOpcode::BadRequest, 2), (ResponseOpcode::Conflict, 3), (ResponseOpcode::Forbidden, 4), (ResponseOpcode::InternalError, 5), (ResponseOpcode::Unauthorized, 6), (ResponseOpcode::Message, 7), (ResponseOpcode::NotFound, 8)]),
             opcode_pos: 1,
             version_pos: 2,

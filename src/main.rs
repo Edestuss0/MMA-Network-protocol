@@ -1,19 +1,23 @@
-use std::collections::HashMap;
 use MMA::core::config::Config;
 use MMA::core::router::Router;
 use MMA::core::server::Server;
-use MMA::protocol::commands::{RequestOpcode, Response, ResponseHeaders, ResponseOpcode};
+use MMA::protocol::commands::RequestOpcode::{Channel, Once};
+use MMA::protocol::commands::{Response, ResponseHeaders, ResponseOpcode};
 use MMA::protocol::config::FramerConfig;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    let mut req_opcodes = [None; 256];
+    req_opcodes[1] = Some(Channel);
+    req_opcodes[2] = Some(Once);
     let config = Config{
         address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0,)), 8080),
         frame_config: FramerConfig{
-            request_opcode_code: HashMap::from([(1, RequestOpcode::Channel), (2, RequestOpcode::Once)]),
+            request_opcode_code: req_opcodes,
             response_opcode_code: HashMap::from([(ResponseOpcode::Ok, 1), (ResponseOpcode::BadRequest, 2), (ResponseOpcode::Conflict, 3), (ResponseOpcode::Forbidden, 4), (ResponseOpcode::InternalError, 5), (ResponseOpcode::Unauthorized, 6), (ResponseOpcode::Message, 7), (ResponseOpcode::NotFound, 8)]),
             opcode_pos: 1,
             version_pos: 4,
@@ -24,7 +28,7 @@ async fn main() {
             options_order: 2,
             payload_order: 1,
             options_key_first: true,
-            header_length: 17,
+            header_length: 29,
         }
     };
 
@@ -41,7 +45,7 @@ async fn main() {
     router.register_route(
         "GET".to_string(),
         Arc::new(move |request| {
-            return Response{options: vec![], payload: request.payload, headers: ResponseHeaders{opcode: ResponseOpcode::Ok, version: 1}}
+            return Response{options: vec![], payload: request.payload, headers: ResponseHeaders{opcode: ResponseOpcode::Ok, version: 1, req_id: request.headers.req_id}}
         })
     );
 
@@ -58,7 +62,7 @@ async fn main() {
         };
         let response = format!("{}^{} = {}", number, pow, (number.pow(pow))).to_string();
 
-        return Response{headers: ResponseHeaders{opcode: ResponseOpcode::Ok, version: 1}, payload: Bytes::from(response), options: vec![]}
+        return Response{headers: ResponseHeaders{opcode: ResponseOpcode::Ok, version: 1, req_id: frame.headers.req_id}, payload: Bytes::from(response), options: vec![]}
 
     }));
 

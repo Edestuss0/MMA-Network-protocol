@@ -40,14 +40,14 @@ impl Server {
             let frame_config = self.config.frame_config.clone();
 
             tokio::spawn(async move {
-            let mut framed = Framed::new(socket, Framer{config: frame_config.clone()});
+            let mut framed = Framed::new(socket, Framer::new(frame_config));
 
                 while let Some(result) = framed.next().await {
                     match result {
                         Ok(cmd) => {
                             print!("{:?}", cmd.payload);
 
-                            let response = router.handle(cmd);
+                            let response = router.handle(cmd).await;
 
                             match framed.send(response).await {
                                 Ok(_) => {
