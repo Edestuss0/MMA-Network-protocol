@@ -1,11 +1,11 @@
 use crate::core::config::Config;
 use crate::core::router::Router;
-use crate::protocol::framer::{Framer};
+use crate::protocol::commands::Response;
+use crate::protocol::framer::Framer;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
-use crate::protocol::commands::Response;
 
 pub struct Server {
     config: Config,
@@ -15,7 +15,7 @@ pub struct Server {
 impl Server {
     pub async fn new(config: Config) -> Result<Self, std::io::Error> {
         match config.frame_config.validate() {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(_) => {
                 eprintln!("Invalid frame config");
                 panic!();
@@ -29,7 +29,6 @@ impl Server {
         })
     }
     pub async fn run(&mut self, router: Router) -> Result<(), std::io::Error> {
-
         println!("Server listen on {} now", self.config.address);
         let router = Arc::new(router);
 
@@ -55,24 +54,24 @@ impl Server {
                     }
                 });
 
-               while let Some(frame) = stream.next().await {
-                   match frame {
-                       Ok(cmd) => {
-                           let tx_clone = tx.clone();
-                           let router_clone = Arc::clone(&router);
-                           tokio::spawn(async move {
-                               let response = router_clone.handle(cmd).await;
-                               if let Err(e) = tx_clone.send(response).await {
-                                   eprintln!("{}", e);
-                               }
-                           });
-                       }
-                       Err(e) => {
-                           eprintln!("{:?}", e);
-                           break;
-                       }
-                   }
-               }
+                while let Some(frame) = stream.next().await {
+                    match frame {
+                        Ok(cmd) => {
+                            let tx_clone = tx.clone();
+                            let router_clone = Arc::clone(&router);
+                            tokio::spawn(async move {
+                                let response = router_clone.handle(cmd).await;
+                                if let Err(e) = tx_clone.send(response).await {
+                                    eprintln!("{}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("{:?}", e);
+                            break;
+                        }
+                    }
+                }
             });
         }
     }

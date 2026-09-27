@@ -1,12 +1,13 @@
-use std::collections::HashMap;
 use crate::protocol::commands::{RequestOpcode, ResponseOpcode};
 use crate::protocol::framer::RequestOpcode::{Channel, Once};
+use crate::protocol::framer::ResponseOpcode::{
+    BadRequest, Conflict, Forbidden, InternalError, Message, NotFound, Unauthorized,
+};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct FramerConfig {
     pub max_message_length: u32,
-    pub request_opcode_code: [Option<RequestOpcode>; 256],
-    pub response_opcode_code: HashMap<ResponseOpcode, u8>,
     pub opcode_pos: u8,
     pub version_pos: u8,
     pub route_len_pos: u8,
@@ -16,6 +17,7 @@ pub struct FramerConfig {
     pub options_count_pos: u8,
     pub options_key_first: bool,
     pub header_length: u8,
+    pub response_code_by_opcode: [u8; 8],
 }
 
 pub const MIN_HEADER_LEN: u8 = 13;
@@ -25,12 +27,19 @@ impl FramerConfig {
         if self.header_length < MIN_HEADER_LEN {
             return Err(());
         }
-        let poses = [self.opcode_pos, self.version_pos, self.route_len_pos, self.options_count_pos];
+        let poses = [
+            self.opcode_pos,
+            self.version_pos,
+            self.route_len_pos,
+            self.options_count_pos,
+        ];
         if poses.contains(&0) {
             return Err(());
         }
         for item in poses {
-            if poses.iter().filter(|&&x| x == item).count() > 1 || item >= (self.header_length - RESERVED_SUFFIX) {
+            if poses.iter().filter(|&&x| x == item).count() > 1
+                || item >= (self.header_length - RESERVED_SUFFIX)
+            {
                 return Err(());
             }
         }
@@ -40,12 +49,17 @@ impl FramerConfig {
             return Err(());
         }
         for item in orders {
-            if orders.iter().filter(|&&x| x == item).count() > 1 || item > 3  {
+            if orders.iter().filter(|&&x| x == item).count() > 1 || item > 3 {
                 return Err(());
             }
         }
 
-        if self.request_opcode_code.is_empty() || self.response_opcode_code.is_empty() || self.request_opcode_code.iter().all(|o| o.is_none()) {return Err(())}
+        // if self.request_opcode_code.is_empty()
+        //     || self.response_opcode_code.is_empty()
+        //     || self.request_opcode_code.iter().all(|o| o.is_none())
+        // {
+        //     return Err(());
+        // }
 
         Ok(())
     }
@@ -53,9 +67,19 @@ impl FramerConfig {
         let mut req_opcodes = [None; 256];
         req_opcodes[1] = Some(Channel);
         req_opcodes[2] = Some(Once);
+        let mut res_opcodes = [None; 256];
+        res_opcodes[1] = Some(ResponseOpcode::Ok);
+        res_opcodes[2] = Some(BadRequest);
+        res_opcodes[3] = Some(Conflict);
+        res_opcodes[4] = Some(Forbidden);
+        res_opcodes[5] = Some(InternalError);
+        res_opcodes[6] = Some(Unauthorized);
+        res_opcodes[7] = Some(Message);
+        res_opcodes[8] = Some(NotFound);
         Self {
-            request_opcode_code: req_opcodes,
-            response_opcode_code: HashMap::from([(ResponseOpcode::Ok, 1), (ResponseOpcode::BadRequest, 2), (ResponseOpcode::Conflict, 3), (ResponseOpcode::Forbidden, 4), (ResponseOpcode::InternalError, 5), (ResponseOpcode::Unauthorized, 6), (ResponseOpcode::Message, 7), (ResponseOpcode::NotFound, 8)]),
+            response_code_by_opcode: [1,2,3,4,5,6,7,8],
+            // request_opcode_code: req_opcodes,
+            // response_opcode_code: res_opcodes,
             opcode_pos: 1,
             version_pos: 2,
             max_message_length: 10 * 1000 * 1000,

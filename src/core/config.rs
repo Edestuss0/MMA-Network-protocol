@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use crate::protocol::config::FramerConfig;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct Config {

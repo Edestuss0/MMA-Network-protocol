@@ -1,6 +1,6 @@
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::io;
-use bytes::Bytes;
 use thiserror::Error;
 
 pub struct Request {
@@ -23,8 +23,20 @@ pub struct RequestHeaders {
 
 #[derive(Debug, Clone, Copy)]
 pub enum RequestOpcode {
-    Once,
-    Channel,
+    Once = 2,
+    Channel = 1,
+}
+
+impl TryFrom<u8> for RequestOpcode {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            2 => Ok(RequestOpcode::Once),
+            1 => Ok(RequestOpcode::Channel),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -48,16 +60,24 @@ pub struct ResponseHeaders {
     pub req_id: u32,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+#[derive(Debug)]
+pub struct OptionValue {
+    pub key: Bytes,
+    pub value: Bytes,
+}
+
+pub const RESPONSE_OPCODES_COUNT: usize = 8;
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Copy)]
 pub enum ResponseOpcode {
-    Ok,
-    BadRequest,
-    Unauthorized,
-    Forbidden,
-    NotFound,
-    Conflict,
-    InternalError,
-    Message,
+    Ok = 1,
+    BadRequest = 2,
+    Unauthorized = 3,
+    Forbidden = 4,
+    NotFound = 5,
+    Conflict = 6,
+    InternalError = 7,
+    Message = 8,
 }
 
 #[derive(Debug)]

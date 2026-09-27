@@ -1,7 +1,12 @@
-pub(crate) use crate::protocol::commands::{ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders, ResponseOpcode};
+pub(crate) use crate::protocol::commands::{
+    ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders,
+    ResponseOpcode,
+};
 use crate::protocol::config::FramerConfig;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::ops::Index;
 use tokio_util::codec::{Decoder, Encoder};
+use crate::protocol::commands::OptionValue;
 
 #[derive(Clone, Debug)]
 pub struct Framer {
@@ -11,7 +16,7 @@ pub struct Framer {
 
 impl Framer {
     pub fn new(cfg: FramerConfig) -> Self {
-        Self{
+        Self {
             config: cfg,
             cached_header: None,
         }
@@ -21,37 +26,69 @@ impl Framer {
 impl Encoder<Response> for Framer {
     type Error = ProtocolError;
 
-    fn encode(&mut self, item: Response, dst: &mut BytesMut) -> Result<(), Self::Error> {
-
+    fn encode(
+        &mut self,
+        item: Response,
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
         if item.options.len() > u8::MAX as usize {
             return Err(ProtocolError::InvalidFrame("Too many options"));
         }
 
+        let hlen = self.config.header_length as usize;
 
-        dst.put_slice(&([0 as u8; 13]));
-
-        if item.payload.len() + item.options.len() > self.config.max_message_length as usize {
-            return Err(ProtocolError::MessageTooLarge(item.payload.len() + item.options.len()));
+        if hlen < 12 {
+            return Err(ProtocolError::InvalidFrame(
+                "Header is too short",
+            ));
         }
-        let option_length: u32 = match calculate_options_length(&item.options) {
-            Ok(l) => l,
-            Err(e) => return Err(e),
-        };
-        match encode_headers(&item.headers, item.options.len() as u8, option_length as u32, item.payload.len() as u32,  &self.config, dst) {
-            Ok(()) => {},
-            Err(e) => {
-                return Err(e);
-            }
-        };
+
+        let frame_start = dst.len();
+
+        // Резервируем место ПОД HEADER.
+        dst.resize(frame_start + hlen, 0);
+
+        let mut option_length = 0u32;
 
         if self.config.payload_order > self.config.options_order {
-            encode_options(&item.options, &self.config, dst);
+            option_length = encode_options(
+                &item.options,
+                &self.config,
+                dst,
+            )?;
+
             dst.put_slice(&item.payload);
         } else {
             dst.put_slice(&item.payload);
-            encode_options(&item.options, &self.config, dst)
+
+            option_length = encode_options(
+                &item.options,
+                &self.config,
+                dst,
+            )?;
         }
 
+        let body_length =
+            item.payload.len() as u32
+                + option_length;
+
+        if body_length > self.config.max_message_length {
+            return Err(
+                ProtocolError::MessageTooLarge(
+                    body_length as usize
+                )
+            );
+        }
+
+        encode_headers(
+            &item.headers,
+            item.options.len() as u8,
+            option_length,
+            item.payload.len() as u32,
+            &self.config,
+            dst,
+            frame_start,
+        )?;
 
         Ok(())
     }
@@ -82,17 +119,15 @@ impl Decoder for Framer {
 
         let body_len = (headers.payload_len as usize)
             .checked_add(headers.route_len as usize)
-            .and_then(|v| {
-                v.checked_add(headers.options_len as usize)
-            })
-            .ok_or(ProtocolError::InvalidFrame(
-                "Frame length overflow",
-            ))?;
+            .and_then(|v| v.checked_add(headers.options_len as usize))
+            .ok_or(ProtocolError::InvalidFrame("Frame length overflow"))?;
         if body_len > self.config.max_message_length as usize {
             return Err(ProtocolError::MessageTooLarge(body_len));
         }
 
-        let frame_len = (self.config.header_length as usize).checked_add(body_len).ok_or(ProtocolError::InvalidFrame("Frame length overflow"))?;
+        let frame_len = (self.config.header_length as usize)
+            .checked_add(body_len)
+            .ok_or(ProtocolError::InvalidFrame("Frame length overflow"))?;
 
         if src.len() < frame_len {
             self.cached_header = Some(headers);
@@ -110,10 +145,12 @@ impl Decoder for Framer {
         for i in 1..=3 {
             if self.config.options_order == i {
                 let option_bytes = src.split_to(headers.options_len as usize);
-                options = decode_options(option_bytes, &self.config, &headers).map_err(|e| { return e })?;
+                options =
+                    decode_options(option_bytes, &self.config, &headers).map_err(|e| return e)?;
             } else if self.config.route_order == i {
                 let route_bytes = src.split_to(headers.route_len as usize);
-                route = String::from_utf8(route_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid route"))?;
+                route = String::from_utf8(route_bytes.into())
+                    .map_err(|_| ProtocolError::InvalidFrame("Invalid route"))?;
             } else if self.config.payload_order == i {
                 payload = src.split_to(headers.payload_len as usize).freeze();
             }
@@ -130,44 +167,55 @@ impl Decoder for Framer {
 
 const MIN_OPTION_LENGTH: usize = 2 + 2 + 1 + 1;
 
-fn calculate_options_length(options: &Vec<(String, String)>) -> Result<u32, ProtocolError> {
-    let mut length = 0;
-    for (key, value) in options {
-        if key.len() > u16::MAX as usize {
-            return Err(ProtocolError::InvalidFrame("Option key is too large"));
-        }
-        if value.len() > u16::MAX as usize {
-            return Err(ProtocolError::InvalidFrame("Option value is too large"));
-        }
-        if key.is_empty() || value.is_empty() {
-            return Err(ProtocolError::InvalidFrame("Option can be empty"));
-        }
-        length += 4 + key.len() + value.len();
-    }
-    Ok(length as u32)
-}
+fn encode_options(options: &Vec<(String, String)>, config: &FramerConfig, dst: &mut BytesMut) -> Result<u32, ProtocolError> {
+    let start = dst.len();
 
-fn encode_options(options: &Vec<(String, String)>, config: &FramerConfig, dst: &mut BytesMut) {
     for (key, value) in options {
+        let key = key.as_bytes();
+        let value = value.as_bytes();
+
+        if key.is_empty() || value.is_empty() {
+            return Err(
+                ProtocolError::InvalidFrame(
+                    "Option can be empty"
+                )
+            );
+        }
+
+        if key.len() > u16::MAX as usize ||
+            value.len() > u16::MAX as usize {
+            return Err(
+                ProtocolError::InvalidFrame(
+                    "Option too large"
+                )
+            );
+        }
+
         dst.put_u16(key.len() as u16);
         dst.put_u16(value.len() as u16);
 
         if config.options_key_first {
-            dst.put_slice(key.as_bytes());
-            dst.put_slice(value.as_bytes());
+            dst.put_slice(key);
+            dst.put_slice(value);
         } else {
-            dst.put_slice(value.as_bytes());
-            dst.put_slice(key.as_bytes());
+            dst.put_slice(value);
+            dst.put_slice(key);
         }
     }
+
+    Ok((dst.len() - start) as u32)
 }
 
-fn decode_options(mut raw: BytesMut, config: &FramerConfig, headers: &RequestHeaders, ) -> Result<Vec<(String, String)>, ProtocolError> {
+fn decode_options(
+    mut raw: BytesMut,
+    config: &FramerConfig,
+    headers: &RequestHeaders,
+) -> Result<Vec<(String, String)>, ProtocolError> {
     if headers.options_count == 0 {
         if !raw.is_empty() {
             return Err(ProtocolError::InvalidFrame("Invalid options format"));
         }
-        return Ok(vec![])
+        return Ok(vec![]);
     }
     if raw.len() < MIN_OPTION_LENGTH {
         return Err(ProtocolError::InvalidFrame("Invalid options format"));
@@ -190,14 +238,18 @@ fn decode_options(mut raw: BytesMut, config: &FramerConfig, headers: &RequestHea
 
         if config.options_key_first {
             let key_bytes = raw.split_to(key_count as usize);
-            key = String::from_utf8(key_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
+            key = String::from_utf8(key_bytes.into())
+                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
             let value_bytes = raw.split_to(value_count as usize);
-            value = String::from_utf8(value_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
+            value = String::from_utf8(value_bytes.into())
+                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
         } else {
             let value_bytes = raw.split_to(value_count as usize);
-            value = String::from_utf8(value_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
+            value = String::from_utf8(value_bytes.into())
+                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
             let key_bytes = raw.split_to(key_count as usize);
-            key = String::from_utf8(key_bytes.into()).map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
+            key = String::from_utf8(key_bytes.into())
+                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
         }
         options.push((key, value));
     }
@@ -209,23 +261,39 @@ fn decode_options(mut raw: BytesMut, config: &FramerConfig, headers: &RequestHea
     return Ok(options);
 }
 
-fn encode_headers(headers: &ResponseHeaders, options_count: u8, options_len: u32, payload_len: u32, config: &FramerConfig, dst: &mut BytesMut) -> Result<(), ProtocolError> {
-    let opcode_bytes = match config.response_opcode_code.get(&headers.opcode).cloned() {
-        Some(value) => value,
-        None => {
-            return Err(ProtocolError::InvalidFrame("Invalid opcode"));
-        }
-    };
-
+fn encode_headers(
+    headers: &ResponseHeaders,
+    options_count: u8,
+    options_len: u32,
+    payload_len: u32,
+    config: &FramerConfig,
+    dst: &mut BytesMut,
+    frame_start: usize,
+) -> Result<(), ProtocolError> {
     let hlen = config.header_length as usize;
-    dst.resize(hlen, 0);
 
-    dst[(config.version_pos - 1) as usize] = headers.version;
-    dst[(config.opcode_pos - 1) as usize] = opcode_bytes;
-    dst[(config.options_count_pos - 1) as usize] = options_count;
-    dst[hlen - 12..hlen - 8].copy_from_slice(&options_len.to_be_bytes());
-    dst[hlen - 8..hlen - 4].copy_from_slice(&payload_len.to_be_bytes());
-    dst[hlen - 4..hlen].copy_from_slice(&headers.req_id.to_be_bytes());
+    let frame_end = frame_start
+        .checked_add(hlen)
+        .ok_or(ProtocolError::InvalidFrame("Header position overflow", ))?;
+
+    if dst.len() < frame_end {
+        return Err(ProtocolError::InvalidFrame("Header buffer is too short", ));
+    }
+
+    let opcode = headers.opcode as u8;
+
+    dst[frame_start + (config.version_pos - 1) as usize] = headers.version;
+
+    dst[frame_start + (config.opcode_pos - 1) as usize] = opcode;
+
+    dst[frame_start + (config.options_count_pos - 1) as usize] = options_count;
+
+    let options_start = frame_end - 12;
+    let payload_start = frame_end - 8;
+    let req_id_start = frame_end - 4;
+
+    dst[options_start..payload_start].copy_from_slice(&options_len.to_be_bytes());
+    dst[payload_start..req_id_start].copy_from_slice(&payload_len.to_be_bytes());dst[req_id_start..frame_end].copy_from_slice(&headers.req_id.to_be_bytes());
 
     Ok(())
 }
@@ -236,15 +304,12 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
     }
 
     let opcode: RequestOpcode;
+
     match bytes.get((config.opcode_pos - 1) as usize) {
         Some(&value) => {
-            opcode = match config
-                .request_opcode_code
-                .get(value as usize)
-                .cloned()
-                .ok_or(ProtocolError::InvalidFrame("Invalid opcode"))? {
-                Some(value) => value,
-                None => return Err(ProtocolError::InvalidFrame("Invalid opcode")),
+            opcode = match RequestOpcode::try_from(value) {
+                Ok(value) => value,
+                Err(_) => return Err(ProtocolError::InvalidFrame("Invalid opcode")),
             }
         }
         None => {
