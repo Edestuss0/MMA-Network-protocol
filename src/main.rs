@@ -12,25 +12,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() {
-    let mut req_opcodes = [None; 256];
-    req_opcodes[1] = Some(Channel);
-    req_opcodes[2] = Some(Once);
-    let mut res_opcodes = [None; 256];
-    res_opcodes[1] = Some(ResponseOpcode::Ok);
-    res_opcodes[2] = Some(BadRequest);
-    res_opcodes[3] = Some(Conflict);
-    res_opcodes[4] = Some(Forbidden);
-    res_opcodes[5] = Some(InternalError);
-    res_opcodes[6] = Some(Unauthorized);
-    res_opcodes[7] = Some(Message);
-    res_opcodes[8] = Some(NotFound);
+async fn main() {   
     let config = Config {
         address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
         frame_config: FramerConfig {
-            response_code_by_opcode: [0,1,3,4,5,6,7,8],
-            // request_opcode_code: req_opcodes,
-            // response_opcode_code: res_opcodes,
             opcode_pos: 1,
             version_pos: 4,
             max_message_length: 10 * 1000 * 1000,

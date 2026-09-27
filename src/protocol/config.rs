@@ -17,10 +17,9 @@ pub struct FramerConfig {
     pub options_count_pos: u8,
     pub options_key_first: bool,
     pub header_length: u8,
-    pub response_code_by_opcode: [u8; 8],
 }
 
-pub const MIN_HEADER_LEN: u8 = 13;
+pub const MIN_HEADER_LEN: u8 = 17;
 pub const RESERVED_SUFFIX: u8 = 12;
 impl FramerConfig {
     pub fn validate(&self) -> Result<(), ()> {
@@ -54,32 +53,10 @@ impl FramerConfig {
             }
         }
 
-        // if self.request_opcode_code.is_empty()
-        //     || self.response_opcode_code.is_empty()
-        //     || self.request_opcode_code.iter().all(|o| o.is_none())
-        // {
-        //     return Err(());
-        // }
-
         Ok(())
     }
     pub fn new() -> Self {
-        let mut req_opcodes = [None; 256];
-        req_opcodes[1] = Some(Channel);
-        req_opcodes[2] = Some(Once);
-        let mut res_opcodes = [None; 256];
-        res_opcodes[1] = Some(ResponseOpcode::Ok);
-        res_opcodes[2] = Some(BadRequest);
-        res_opcodes[3] = Some(Conflict);
-        res_opcodes[4] = Some(Forbidden);
-        res_opcodes[5] = Some(InternalError);
-        res_opcodes[6] = Some(Unauthorized);
-        res_opcodes[7] = Some(Message);
-        res_opcodes[8] = Some(NotFound);
         Self {
-            response_code_by_opcode: [1,2,3,4,5,6,7,8],
-            // request_opcode_code: req_opcodes,
-            // response_opcode_code: res_opcodes,
             opcode_pos: 1,
             version_pos: 2,
             max_message_length: 10 * 1000 * 1000,
