@@ -5,4 +5,5 @@ use std::net::SocketAddr;
 pub struct Config {
     pub address: SocketAddr,
     pub frame_config: FramerConfig,
+    pub max_batch: u8
 }

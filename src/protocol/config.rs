@@ -1,10 +1,3 @@
-use crate::protocol::commands::{RequestOpcode, ResponseOpcode};
-use crate::protocol::framer::RequestOpcode::{Channel, Once};
-use crate::protocol::framer::ResponseOpcode::{
-    BadRequest, Conflict, Forbidden, InternalError, Message, NotFound, Unauthorized,
-};
-use std::collections::HashMap;
-
 #[derive(Debug, Clone)]
 pub struct FramerConfig {
     pub max_message_length: u32,
@@ -23,7 +16,7 @@ pub const MIN_HEADER_LEN: u8 = 17;
 pub const RESERVED_SUFFIX: u8 = 12;
 impl FramerConfig {
     pub fn validate(&self) -> Result<(), ()> {
-        if self.header_length < MIN_HEADER_LEN {
+        if self.header_length < MIN_HEADER_LEN || self.header_length - RESERVED_SUFFIX < MIN_HEADER_LEN {
             return Err(());
         }
         let poses = [
@@ -37,7 +30,7 @@ impl FramerConfig {
         }
         for item in poses {
             if poses.iter().filter(|&&x| x == item).count() > 1
-                || item >= (self.header_length - RESERVED_SUFFIX)
+                || item > (self.header_length - RESERVED_SUFFIX)
             {
                 return Err(());
             }

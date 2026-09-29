@@ -1,10 +1,6 @@
 use MMA::core::config::Config;
 use MMA::core::router::Router;
 use MMA::core::server::Server;
-use MMA::protocol::commands::RequestOpcode::{Channel, Once};
-use MMA::protocol::commands::ResponseOpcode::{
-    BadRequest, Conflict, Forbidden, InternalError, Message, NotFound, Unauthorized,
-};
 use MMA::protocol::commands::{Response, ResponseHeaders, ResponseOpcode};
 use MMA::protocol::config::FramerConfig;
 use bytes::Bytes;
@@ -27,6 +23,7 @@ async fn main() {
             options_key_first: true,
             header_length: 29,
         },
+        max_batch: 255
     };
 
     let mut router = Router::new();
@@ -58,18 +55,17 @@ async fn main() {
         "POW".to_string(),
         Arc::new(move |frame| {
             let mut payload = frame.payload.clone();
-            println!("{:?}", &payload);
-            let number = match String::from_utf8(payload.to_vec()) {
+            let number = match std::str::from_utf8(&payload) {
                 Ok(value) => value,
-                Err(_) => "2".to_string(),
+                Err(_) => "2"
             }
             .parse::<i32>()
             .unwrap_or(1);
-            let pow: u32 = match frame.options.iter().find(|x| x.0 == "pow".to_string()) {
+            let pow: u32 = match frame.options.iter().find(|x| x.0 == "pow") {
                 Some(value) => value.1.parse().unwrap_or_else(|_| 2),
                 None => 2,
             };
-            let response = format!("{}^{} = {}", number, pow, (number.pow(pow))).to_string();
+            let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
 
             return Response {
                 headers: ResponseHeaders {

@@ -35,20 +35,37 @@ impl Server {
         loop {
             let (socket, address) = self.tcp_listener.accept().await?;
             socket.set_nodelay(true)?;
-
-            println!("New connection from {}", address);
             let router = Arc::clone(&router);
             let frame_config = self.config.frame_config.clone();
+
+            let max_batch = self.config.max_batch;
 
             tokio::spawn(async move {
                 let mut framed = Framed::new(socket, Framer::new(frame_config));
                 let (mut sink, mut stream) = framed.split();
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(100);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
 
                 tokio::spawn(async move {
                     while let Some(frame) = rx.recv().await {
-                        if let Err(e) = sink.send(frame).await {
+
+                        if let Err(e) = sink.feed(frame).await {
                             eprintln!("Error sending frame: {}", e);
+                            break;
+                        }
+                        let mut count = 1;
+                        while count < max_batch {
+                            match rx.try_recv() {
+                                Ok(x) => {
+                                    if let Err(_) = sink.feed(x).await {
+                                        break;
+                                    }
+                                    count += 1;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if let Err(e) = sink.flush().await {
+                            eprintln!("Error flushing sink: {}", e);
                             break;
                         }
                     }
@@ -60,7 +77,7 @@ impl Server {
                             let tx_clone = tx.clone();
                             let router_clone = Arc::clone(&router);
                             tokio::spawn(async move {
-                                let response = router_clone.handle(cmd).await;
+                                let response = router_clone.handle(cmd);
                                 if let Err(e) = tx_clone.send(response).await {
                                     eprintln!("{}", e);
                                 }

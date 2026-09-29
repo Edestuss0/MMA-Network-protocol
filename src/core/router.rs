@@ -21,7 +21,7 @@ impl Router {
         self.routes.insert(route, handler);
     }
 
-    pub async fn handle(&self, frame: Request) -> Response {
+    pub fn handle(&self, frame: Request) -> Response {
         match self.routes.get(&frame.route) {
             Some(handler) => handler(frame),
             None => Response {

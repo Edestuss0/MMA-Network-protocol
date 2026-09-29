@@ -24,6 +24,7 @@ impl Framer {
 }
 
 impl Encoder<Response> for Framer {
+
     type Error = ProtocolError;
 
     fn encode(
@@ -37,42 +38,45 @@ impl Encoder<Response> for Framer {
 
         let hlen = self.config.header_length as usize;
 
-        if hlen < 12 {
-            return Err(ProtocolError::InvalidFrame(
-                "Header is too short",
-            ));
-        }
-
         let frame_start = dst.len();
 
-        // Резервируем место ПОД HEADER.
         dst.resize(frame_start + hlen, 0);
 
         let mut option_length = 0u32;
 
         if self.config.payload_order > self.config.options_order {
-            option_length = encode_options(
+            option_length = match encode_options(
                 &item.options,
                 &self.config,
                 dst,
-            )?;
-
+            ) {
+                Ok(len) => len,
+                Err(e) => {
+                    dst.truncate(frame_start);
+                    return Err(e)
+                },
+            };
             dst.put_slice(&item.payload);
         } else {
             dst.put_slice(&item.payload);
 
-            option_length = encode_options(
+            option_length = match encode_options(
                 &item.options,
                 &self.config,
                 dst,
-            )?;
+            ) {
+                Ok(len) => len,
+                Err(e) => {
+                    dst.truncate(frame_start);
+                    return Err(e)
+                },
+            };
         }
 
-        let body_length =
-            item.payload.len() as u32
-                + option_length;
+        let body_length = item.payload.len() as u32 + option_length;
 
         if body_length > self.config.max_message_length {
+            dst.truncate(frame_start);
             return Err(
                 ProtocolError::MessageTooLarge(
                     body_length as usize
@@ -80,7 +84,7 @@ impl Encoder<Response> for Framer {
             );
         }
 
-        encode_headers(
+        match encode_headers(
             &item.headers,
             item.options.len() as u8,
             option_length,
@@ -88,7 +92,13 @@ impl Encoder<Response> for Framer {
             &self.config,
             dst,
             frame_start,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(e) => return {
+                dst.truncate(frame_start);
+                Err(e)
+            },
+        };
 
         Ok(())
     }
