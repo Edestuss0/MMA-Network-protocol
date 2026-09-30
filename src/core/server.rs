@@ -28,6 +28,9 @@ impl Server {
             tcp_listener: listener,
         })
     }
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
+        self.tcp_listener.local_addr()
+    }
     pub async fn run(&mut self, router: Router) -> Result<(), std::io::Error> {
         println!("Server listen on {} now", self.config.address);
         let router = Arc::new(router);
