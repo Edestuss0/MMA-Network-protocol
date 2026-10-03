@@ -1,14 +1,13 @@
 use MMA::core::config::Config;
 use MMA::core::router::Router;
 use MMA::core::server::Server;
-use MMA::protocol::commands::{Response, ResponseHeaders, ResponseOpcode};
 use MMA::protocol::config::FramerConfig;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() {   
+async fn main() {
     let config = Config {
         address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
         frame_config: FramerConfig {
@@ -38,23 +37,15 @@ async fn main() {
 
     router.register_route(
         "GET".to_string(),
-        Arc::new(move |request| {
-            return Response {
-                options: vec![],
-                payload: request.payload,
-                headers: ResponseHeaders {
-                    opcode: ResponseOpcode::Ok,
-                    version: 1,
-                    req_id: request.headers.req_id,
-                },
-            };
+        Arc::new(move |request, res| {
+            res.payload = request.payload;
         }),
     );
 
     router.register_route(
         "POW".to_string(),
-        Arc::new(move |frame| {
-            let mut payload = frame.payload.clone();
+        Arc::new(move |frame, res| {
+            let payload = frame.payload.clone();
             let number = match std::str::from_utf8(&payload) {
                 Ok(value) => value,
                 Err(_) => "2"
@@ -67,17 +58,9 @@ async fn main() {
             };
             let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
 
-            return Response {
-                headers: ResponseHeaders {
-                    opcode: ResponseOpcode::Ok,
-                    version: 1,
-                    req_id: frame.headers.req_id,
-                },
-                payload: Bytes::from(response),
-                options: vec![],
-            };
+            res.payload = Bytes::from(response);
         }),
     );
 
-    server.run(router).await;
+    let _ = server.run(router).await;
 }

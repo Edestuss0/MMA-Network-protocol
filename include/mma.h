@@ -21,7 +21,8 @@ extern "C" {
 typedef struct MMAFramer MMAFramer;
 typedef struct MMARequest MMARequest;
 typedef struct MMAServer MMAServer;
-typedef struct MMAResponseBuilder MMAResponseBuilder;
+typedef struct MMARouteResponse MMARouteResponse;
+typedef MMARouteResponse MMAResponseBuilder;
 
 typedef struct {
     uint32_t max_message_length;
@@ -67,7 +68,7 @@ typedef struct {
 
 typedef int32_t (*MMARouteCallback)(
     const MMARequest *request,
-    MMAResponseBuilder *response,
+    MMARouteResponse *response,
     void *user_data
 );
 
@@ -129,6 +130,23 @@ int32_t mma_server_bound_port(const MMAServer *server, uint16_t *port);
 int32_t mma_server_stop(MMAServer *server);
 void mma_server_destroy(MMAServer *server);
 
+int32_t mma_response_set_status(
+    MMARouteResponse *response,
+    uint8_t opcode,
+    uint8_t version
+);
+int32_t mma_response_set_payload(
+    MMARouteResponse *response,
+    const uint8_t *data,
+    size_t data_len
+);
+int32_t mma_response_add_option(
+    MMARouteResponse *response,
+    const uint8_t *key,
+    size_t key_len,
+    const uint8_t *value,
+    size_t value_len
+);
 int32_t mma_response_builder_set_status(
     MMAResponseBuilder *builder,
     uint8_t opcode,

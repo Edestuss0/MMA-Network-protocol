@@ -4,9 +4,7 @@ pub(crate) use crate::protocol::commands::{
 };
 use crate::protocol::config::FramerConfig;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::ops::Index;
 use tokio_util::codec::{Decoder, Encoder};
-use crate::protocol::commands::OptionValue;
 
 #[derive(Clone, Debug)]
 pub struct Framer {
@@ -42,7 +40,7 @@ impl Encoder<Response> for Framer {
 
         dst.resize(frame_start + hlen, 0);
 
-        let mut option_length = 0u32;
+        let option_length;
 
         if self.config.payload_order > self.config.options_order {
             option_length = match encode_options(
@@ -113,7 +111,7 @@ impl Decoder for Framer {
             return Ok(None);
         }
 
-        let mut headers: RequestHeaders;
+        let headers: RequestHeaders;
 
         headers = match &self.cached_header {
             Some(val) => val.clone(),

@@ -1,5 +1,5 @@
+use crate::core::config::MMA_VERSION;
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::io;
 use thiserror::Error;
 
@@ -85,4 +85,19 @@ pub struct Response {
     pub headers: ResponseHeaders,
     pub payload: Bytes,
     pub options: Vec<(String, String)>,
+}
+
+
+impl Response {
+    pub fn new(req_id: &u32) -> Self {
+        Self {
+            headers: ResponseHeaders{
+                version: MMA_VERSION,
+                req_id: *req_id,
+                opcode: ResponseOpcode::Ok
+            },
+            payload: Bytes::from("Empty response"),
+            options: Vec::new(),
+        }
+    }
 }

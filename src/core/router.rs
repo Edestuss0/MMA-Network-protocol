@@ -3,8 +3,9 @@ use crate::protocol::framer::{Request, ResponseOpcode};
 use bytes::Bytes;
 use std::sync::Arc;
 use ahash::AHashMap;
+use crate::core::config::MMA_VERSION;
 
-pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
+pub type Handler = Arc<dyn Fn(Request, &mut Response) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Router {
@@ -21,12 +22,35 @@ impl Router {
         self.routes.insert(route, handler);
     }
 
+    fn validate_version(frame: &Request) -> Result<(), Response> {
+        if frame.headers.version != MMA_VERSION {
+            return Err(Response{
+                headers: ResponseHeaders{
+                    version: MMA_VERSION,
+                    opcode: ResponseOpcode::BadRequest,
+                    req_id: frame.headers.req_id
+                },
+                payload: Bytes::from("Incorrect protocol version"),
+                options: Vec::new(),
+            })
+        }
+
+        return Ok(())
+    }
+
     pub fn handle(&self, frame: Request) -> Response {
+        if let Err(e) = Self::validate_version(&frame) {
+            return e
+        }
         match self.routes.get(&frame.route) {
-            Some(handler) => handler(frame),
+            Some(handler) => { 
+                let mut response = Response::new(&frame.headers.req_id);
+                handler(frame, &mut response);
+                response
+            },
             None => Response {
                 headers: ResponseHeaders {
-                    version: 1,
+                    version: MMA_VERSION,
                     opcode: ResponseOpcode::NotFound,
                     req_id: frame.headers.req_id,
                 },

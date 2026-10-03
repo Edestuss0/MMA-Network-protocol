@@ -3,7 +3,7 @@ use crate::core::router::Router;
 use crate::protocol::commands::Response;
 use crate::protocol::framer::Framer;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
 
@@ -36,7 +36,7 @@ impl Server {
         let router = Arc::new(router);
 
         loop {
-            let (socket, address) = self.tcp_listener.accept().await?;
+            let (socket, _) = self.tcp_listener.accept().await?;
             socket.set_nodelay(true)?;
             let router = Arc::clone(&router);
             let frame_config = self.config.frame_config.clone();
@@ -44,7 +44,7 @@ impl Server {
             let max_batch = self.config.max_batch;
 
             tokio::spawn(async move {
-                let mut framed = Framed::new(socket, Framer::new(frame_config));
+                let framed = Framed::new(socket, Framer::new(frame_config));
                 let (mut sink, mut stream) = framed.split();
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
 

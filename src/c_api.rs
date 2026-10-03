@@ -79,7 +79,7 @@ pub struct MMAServerConfig {
 }
 
 pub type MMARouteCallback =
-    Option<extern "C" fn(*const MMARequest, *mut MMAResponseBuilder, *mut c_void) -> i32>;
+    Option<extern "C" fn(*const MMARequest, *mut MMARouteResponse, *mut c_void) -> i32>;
 
 pub struct MMAFramer {
     framer: Framer,
@@ -90,17 +90,13 @@ pub struct MMARequest {
     request: Request,
 }
 
-pub struct MMAResponseBuilder {
-    opcode: ResponseOpcode,
-    version: u8,
-    req_id: u32,
-    payload: Vec<u8>,
-    options: Vec<(String, String)>,
+pub struct MMARouteResponse {
+    response: *mut Response,
 }
 
 struct RegisteredRoute {
     route: String,
-    callback: extern "C" fn(*const MMARequest, *mut MMAResponseBuilder, *mut c_void) -> i32,
+    callback: extern "C" fn(*const MMARequest, *mut MMARouteResponse, *mut c_void) -> i32,
     user_data: usize,
 }
 
@@ -174,14 +170,12 @@ fn copy_response(response: &MMAResponse) -> Result<Response, i32> {
                 {
                     return Err(MMA_STATUS_INVALID_ARGUMENT);
                 }
-                let key =
-                    std::str::from_utf8(std::slice::from_raw_parts(option.key, option.key_len))
-                        .map_err(|_| MMA_STATUS_INVALID_ARGUMENT)?
-                        .to_owned();
-                let value =
-                    std::str::from_utf8(std::slice::from_raw_parts(option.value, option.value_len))
-                        .map_err(|_| MMA_STATUS_INVALID_ARGUMENT)?
-                        .to_owned();
+                let key = std::str::from_utf8(raw_slice(option.key, option.key_len))
+                    .map_err(|_| MMA_STATUS_INVALID_ARGUMENT)?
+                    .to_owned();
+                let value = std::str::from_utf8(raw_slice(option.value, option.value_len))
+                    .map_err(|_| MMA_STATUS_INVALID_ARGUMENT)?
+                    .to_owned();
                 Ok((key, value))
             })
             .collect::<Result<Vec<_>, i32>>()?
@@ -196,6 +190,13 @@ fn copy_response(response: &MMAResponse) -> Result<Response, i32> {
         payload,
         options,
     })
+}
+
+unsafe fn route_response_mut<'a>(response: *mut MMARouteResponse) -> Result<&'a mut Response, i32> {
+    if response.is_null() || (*response).response.is_null() {
+        return Err(MMA_STATUS_INVALID_ARGUMENT);
+    }
+    Ok(&mut *(*response).response)
 }
 
 fn write_bytes(bytes: &[u8], output: *mut MMABytes) -> i32 {
@@ -429,30 +430,16 @@ fn router_from_routes(routes: &[RegisteredRoute]) -> Router {
         let user_data = registered.user_data;
         router.register_route(
             registered.route.clone(),
-            Arc::new(move |request| {
-                let req_id = request.headers.req_id;
+            Arc::new(move |request, response| {
                 let request = Box::new(MMARequest { request });
-                let mut builder = MMAResponseBuilder {
-                    opcode: ResponseOpcode::Ok,
-                    version: 1,
-                    req_id,
-                    payload: Vec::new(),
-                    options: Vec::new(),
+                let mut route_response = MMARouteResponse {
+                    response: response as *mut Response,
                 };
-                let status = callback(&*request, &mut builder, user_data as *mut c_void);
+                let status = callback(&*request, &mut route_response, user_data as *mut c_void);
                 if status != MMA_STATUS_OK {
-                    builder.opcode = ResponseOpcode::InternalError;
-                    builder.payload.clear();
-                    builder.options.clear();
-                }
-                Response {
-                    headers: ResponseHeaders {
-                        opcode: builder.opcode,
-                        version: builder.version,
-                        req_id: builder.req_id,
-                    },
-                    payload: Bytes::from(builder.payload),
-                    options: builder.options,
+                    response.headers.opcode = ResponseOpcode::InternalError;
+                    response.payload = Bytes::new();
+                    response.options.clear();
                 }
             }),
         );
@@ -672,44 +659,77 @@ pub unsafe extern "C" fn mma_server_destroy(server: *mut MMAServer) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_builder_set_status(
-    builder: *mut MMAResponseBuilder,
+    response: *mut MMARouteResponse,
     opcode: u8,
     version: u8,
 ) -> i32 {
-    if builder.is_null() {
-        return MMA_STATUS_INVALID_ARGUMENT;
-    }
+    mma_response_set_status(response, opcode, version)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_response_set_status(
+    response: *mut MMARouteResponse,
+    opcode: u8,
+    version: u8,
+) -> i32 {
     let Some(opcode) = response_opcode(opcode) else {
         return MMA_STATUS_INVALID_ARGUMENT;
     };
-    (*builder).opcode = opcode;
-    (*builder).version = version;
+    let response = match route_response_mut(response) {
+        Ok(response) => response,
+        Err(status) => return status,
+    };
+    response.headers.opcode = opcode;
+    response.headers.version = version;
     MMA_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_builder_set_payload(
-    builder: *mut MMAResponseBuilder,
+    response: *mut MMARouteResponse,
     data: *const u8,
     data_len: usize,
 ) -> i32 {
-    if builder.is_null() || !valid_slice(data, data_len) {
+    mma_response_set_payload(response, data, data_len)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_response_set_payload(
+    response: *mut MMARouteResponse,
+    data: *const u8,
+    data_len: usize,
+) -> i32 {
+    if !valid_slice(data, data_len) {
         return MMA_STATUS_INVALID_ARGUMENT;
     }
-    (*builder).payload = raw_slice(data, data_len).to_vec();
+    let response = match route_response_mut(response) {
+        Ok(response) => response,
+        Err(status) => return status,
+    };
+    response.payload = Bytes::copy_from_slice(raw_slice(data, data_len));
     MMA_STATUS_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_builder_add_option(
-    builder: *mut MMAResponseBuilder,
+    response: *mut MMARouteResponse,
     key: *const u8,
     key_len: usize,
     value: *const u8,
     value_len: usize,
 ) -> i32 {
-    if builder.is_null()
-        || !valid_slice(key, key_len)
+    mma_response_add_option(response, key, key_len, value, value_len)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_response_add_option(
+    response: *mut MMARouteResponse,
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+) -> i32 {
+    if !valid_slice(key, key_len)
         || !valid_slice(value, value_len)
         || key_len == 0
         || value_len == 0
@@ -725,7 +745,11 @@ pub unsafe extern "C" fn mma_response_builder_add_option(
     if key_len > u16::MAX as usize || value_len > u16::MAX as usize {
         return MMA_STATUS_INVALID_ARGUMENT;
     }
-    (*builder).options.push((key.to_owned(), value.to_owned()));
+    let response = match route_response_mut(response) {
+        Ok(response) => response,
+        Err(status) => return status,
+    };
+    response.options.push((key.to_owned(), value.to_owned()));
     MMA_STATUS_OK
 }
 
@@ -748,6 +772,64 @@ pub extern "C" fn mma_status_message(status: i32) -> *const std::os::raw::c_char
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::commands::{RequestHeaders, RequestOpcode};
+
+    extern "C" fn echo_callback(
+        request: *const MMARequest,
+        response: *mut MMARouteResponse,
+        _user_data: *mut c_void,
+    ) -> i32 {
+        let mut payload = ptr::null();
+        let mut payload_len = 0;
+        let status = unsafe { mma_request_payload(request, &mut payload, &mut payload_len) };
+        if status != MMA_STATUS_OK {
+            return status;
+        }
+        let status = unsafe { mma_response_set_status(response, ResponseOpcode::Message as u8, 1) };
+        if status != MMA_STATUS_OK {
+            return status;
+        }
+        let status = unsafe {
+            mma_response_add_option(
+                response,
+                c"type".as_ptr().cast(),
+                4,
+                c"echo".as_ptr().cast(),
+                4,
+            )
+        };
+        if status != MMA_STATUS_OK {
+            return status;
+        }
+        unsafe { mma_response_set_payload(response, payload, payload_len) }
+    }
+
+    extern "C" fn failing_callback(
+        _request: *const MMARequest,
+        response: *mut MMARouteResponse,
+        _user_data: *mut c_void,
+    ) -> i32 {
+        let payload = b"will be cleared";
+        let _ = unsafe { mma_response_set_payload(response, payload.as_ptr(), payload.len()) };
+        MMA_STATUS_CALLBACK_ERROR
+    }
+
+    fn request(route: &str, payload: &'static [u8], req_id: u32) -> Request {
+        Request {
+            headers: RequestHeaders {
+                opcode: RequestOpcode::Once,
+                version: 1,
+                payload_len: payload.len() as u32,
+                route_len: route.len() as u8,
+                options_len: 0,
+                options_count: 0,
+                req_id,
+            },
+            payload: Bytes::from_static(payload),
+            route: route.to_owned(),
+            options: Vec::new(),
+        }
+    }
 
     #[test]
     fn encode_and_decode_incremental_frame() {
@@ -816,5 +898,44 @@ mod tests {
             mma_bytes_free(encoded);
             mma_framer_destroy(framer);
         }
+    }
+
+    #[test]
+    fn route_callback_mutates_live_response() {
+        let routes = vec![RegisteredRoute {
+            route: "ECHO".to_owned(),
+            callback: echo_callback,
+            user_data: 0,
+        }];
+        let router = router_from_routes(&routes);
+
+        let response = router.handle(request("ECHO", b"hello", 77));
+
+        assert_eq!(response.headers.opcode, ResponseOpcode::Message);
+        assert_eq!(response.headers.version, 1);
+        assert_eq!(response.headers.req_id, 77);
+        assert_eq!(&response.payload[..], b"hello");
+        assert_eq!(
+            response.options,
+            vec![("type".to_owned(), "echo".to_owned())]
+        );
+    }
+
+    #[test]
+    fn route_callback_error_marks_internal_error() {
+        let routes = vec![RegisteredRoute {
+            route: "FAIL".to_owned(),
+            callback: failing_callback,
+            user_data: 0,
+        }];
+        let router = router_from_routes(&routes);
+
+        let response = router.handle(request("FAIL", b"payload", 88));
+
+        assert_eq!(response.headers.opcode, ResponseOpcode::InternalError);
+        assert_eq!(response.headers.version, 1);
+        assert_eq!(response.headers.req_id, 88);
+        assert!(response.payload.is_empty());
+        assert!(response.options.is_empty());
     }
 }

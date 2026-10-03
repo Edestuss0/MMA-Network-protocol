@@ -7,3 +7,5 @@ pub struct Config {
     pub frame_config: FramerConfig,
     pub max_batch: u8
 }
+
+pub const MMA_VERSION: u8 = 1;
