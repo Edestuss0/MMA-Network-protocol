@@ -22,7 +22,8 @@ async fn main() {
             options_key_first: true,
             header_length: 29,
         },
-        max_batch: 255
+        max_batch: 255,
+        max_in_flight: 1024
     };
 
     let mut router = Router::new();

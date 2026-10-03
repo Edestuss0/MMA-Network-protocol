@@ -4,7 +4,9 @@ use crate::protocol::commands::Response;
 use crate::protocol::framer::Framer;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
 
 pub struct Server {
@@ -35,6 +37,8 @@ impl Server {
         println!("Server listen on {} now", self.config.address);
         let router = Arc::new(router);
 
+        let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight as usize));
+
         loop {
             let (socket, _) = self.tcp_listener.accept().await?;
             socket.set_nodelay(true)?;
@@ -42,8 +46,10 @@ impl Server {
             let frame_config = self.config.frame_config.clone();
 
             let max_batch = self.config.max_batch;
+            let semaphore = Arc::clone(&semaphore);
 
             tokio::spawn(async move {
+                let semaphore = Arc::clone(&semaphore);
                 let framed = Framed::new(socket, Framer::new(frame_config));
                 let (mut sink, mut stream) = framed.split();
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
@@ -74,12 +80,16 @@ impl Server {
                     }
                 });
 
+
                 while let Some(frame) = stream.next().await {
                     match frame {
                         Ok(cmd) => {
+                            let semaphore_clone = Arc::clone(&semaphore);
                             let tx_clone = tx.clone();
                             let router_clone = Arc::clone(&router);
+                            let permit = semaphore_clone.acquire_owned().await.unwrap();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 let response = router_clone.handle(cmd);
                                 if let Err(e) = tx_clone.send(response).await {
                                     eprintln!("{}", e);

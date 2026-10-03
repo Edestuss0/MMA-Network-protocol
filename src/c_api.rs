@@ -76,6 +76,7 @@ pub struct MMAServerConfig {
     pub port: u16,
     pub max_batch: u8,
     pub framer: MMAFramerConfig,
+    pub max_in_flight: u32
 }
 
 pub type MMARouteCallback =
@@ -473,6 +474,7 @@ pub extern "C" fn mma_server_config_default(output: *mut MMAServerConfig) -> i32
             port: 8080,
             max_batch: 16,
             framer,
+            max_in_flight: 20000
         };
     }
     MMA_STATUS_OK
@@ -506,6 +508,7 @@ pub unsafe extern "C" fn mma_server_create(
             address: SocketAddr::new(ip, config.port),
             frame_config: framer,
             max_batch: config.max_batch,
+            max_in_flight: config.max_in_flight,
         },
         routes: Vec::new(),
         running: None,
