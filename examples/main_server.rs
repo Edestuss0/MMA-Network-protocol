@@ -1,7 +1,6 @@
-use MMA::core::config::Config;
+use MMA::core::config::{Config, FramerConfig};
 use MMA::core::router::Router;
 use MMA::core::server::Server;
-use MMA::protocol::config::FramerConfig;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;

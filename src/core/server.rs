@@ -1,10 +1,11 @@
+use crate::core::commands::Response;
 use crate::core::config::Config;
 use crate::core::router::Router;
-use crate::protocol::commands::Response;
 use crate::protocol::framer::Framer;
 use futures_util::{SinkExt, StreamExt};
+use std::future::Future;
+use std::io;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
@@ -16,23 +17,35 @@ pub struct Server {
 
 impl Server {
     pub async fn new(config: Config) -> Result<Self, std::io::Error> {
-        match config.frame_config.validate() {
-            Ok(_) => {}
-            Err(_) => {
-                eprintln!("Invalid frame config");
-                panic!();
-            }
-        }
-        let address = format!("{}", config.address);
-        let listener = TcpListener::bind(address).await?;
+        Self::validate_config(&config)?;
+        let listener = TcpListener::bind(config.address).await?;
+        Self::from_listener(config, listener)
+    }
+
+    pub fn from_listener(
+        config: Config,
+        tcp_listener: TcpListener,
+    ) -> Result<Self, std::io::Error> {
+        Self::validate_config(&config)?;
         Ok(Self {
-            config: config,
-            tcp_listener: listener,
+            config,
+            tcp_listener,
         })
+    }
+
+    fn validate_config(config: &Config) -> Result<(), io::Error> {
+        if config.frame_config.validate().is_err() || config.max_in_flight == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid server configuration",
+            ));
+        }
+        Ok(())
     }
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
         self.tcp_listener.local_addr()
     }
+
     pub async fn run(&mut self, router: Router) -> Result<(), std::io::Error> {
         println!("Server listen on {} now", self.config.address);
         let router = Arc::new(router);

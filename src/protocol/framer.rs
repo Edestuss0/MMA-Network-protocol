@@ -1,10 +1,10 @@
-pub(crate) use crate::protocol::commands::{
+pub(crate) use crate::core::commands::{
     ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders,
     ResponseOpcode,
 };
-use crate::protocol::config::FramerConfig;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
+use crate::core::config::FramerConfig;
 
 #[derive(Clone, Debug)]
 pub struct Framer {
