@@ -6,13 +6,22 @@ use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tokio::net::TcpStream;
+use crate::core::config::FramerConfig;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
 
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub struct Server {
     config: Config,
     tcp_listener: TcpListener,
+    stop: CancellationToken,
 }
 
 impl Server {
@@ -30,7 +39,12 @@ impl Server {
         Ok(Self {
             config,
             tcp_listener,
+            stop: CancellationToken::new(),
         })
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.stop.clone()
     }
 
     fn validate_config(config: &Config) -> Result<(), io::Error> {
@@ -48,74 +62,133 @@ impl Server {
 
     pub async fn run(&mut self, router: Router) -> Result<(), std::io::Error> {
         println!("Server listen on {} now", self.config.address);
-        let router = Arc::new(router);
+        self.run_until(router, async { let _ = tokio::signal::ctrl_c().await; }).await
+    }
 
+    pub async fn run_until<F: Future<Output = ()>>(
+        &mut self,
+        router: Router,
+        shutdown: F,
+    ) -> Result<(), std::io::Error> {
+        let router = Arc::new(router);
         let semaphore = Arc::new(Semaphore::new(self.config.max_in_flight as usize));
+        let stop = self.stop.clone();
+        let kill = CancellationToken::new();
+        let conns = TaskTracker::new();
+        let mut result = Ok(());
+        tokio::pin!(shutdown);
 
         loop {
-            let (socket, _) = self.tcp_listener.accept().await?;
-            socket.set_nodelay(true)?;
-            let router = Arc::clone(&router);
-            let frame_config = self.config.frame_config.clone();
+            let socket = tokio::select! {
+                _ = &mut shutdown => break,
+                _ = stop.cancelled() => break,
+                acc = self.tcp_listener.accept() => match acc {
+                    Ok((socket, _)) => socket,
+                    Err(e) => { result = Err(e); break; }
+                },
+            };
+            let _ = socket.set_nodelay(true);
+            conns.spawn(serve_connection(
+                socket,
+                Arc::clone(&router),
+                self.config.frame_config.clone(),
+                self.config.max_batch,
+                Arc::clone(&semaphore),
+                stop.clone(),
+                kill.clone(),
+            ));
+        }
 
-            let max_batch = self.config.max_batch;
-            let semaphore = Arc::clone(&semaphore);
+        stop.cancel();
+        conns.close();
+        if tokio::time::timeout(SHUTDOWN_GRACE, conns.wait()).await.is_err() {
+            eprintln!("graceful shutdown: grace period expired, killing connections");
+            kill.cancel();
+            conns.wait().await;
+        }
+        result
+    }
+}
 
-            tokio::spawn(async move {
-                let semaphore = Arc::clone(&semaphore);
-                let framed = Framed::new(socket, Framer::new(frame_config));
-                let (mut sink, mut stream) = framed.split();
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
+async fn serve_connection(
+    socket: TcpStream,
+    router: Arc<Router>,
+    frame_config: FramerConfig,
+    max_batch: u8,
+    semaphore: Arc<Semaphore>,
+    stop: CancellationToken,
+    kill: CancellationToken,
+) {
+    let framed = Framed::new(socket, Framer::new(frame_config));
+    let (mut sink, mut stream) = framed.split();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
+    let inflight = TaskTracker::new();
 
-                tokio::spawn(async move {
-                    while let Some(frame) = rx.recv().await {
-
-                        if let Err(e) = sink.feed(frame).await {
-                            eprintln!("Error sending frame: {}", e);
-                            break;
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if let Err(e) = sink.feed(frame).await {
+                eprintln!("Error sending frame: {}", e);
+                return;
+            }
+            let mut count = 1;
+            while count < max_batch {
+                match rx.try_recv() {
+                    Ok(x) => {
+                        if sink.feed(x).await.is_err() {
+                            return;
                         }
-                        let mut count = 1;
-                        while count < max_batch {
-                            match rx.try_recv() {
-                                Ok(x) => {
-                                    if let Err(_) = sink.feed(x).await {
-                                        break;
-                                    }
-                                    count += 1;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if let Err(e) = sink.flush().await {
-                            eprintln!("Error flushing sink: {}", e);
-                            break;
-                        }
+                        count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Err(e) = sink.flush().await {
+                eprintln!("Error flushing sink: {}", e);
+                return;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = kill.cancelled() => break,
+            _ = stop.cancelled() => break,
+            f = stream.next() => match f { Some(f) => f, None => break },
+        };
+        match frame {
+            Ok(cmd) => {
+                let permit = tokio::select! {
+                    _ = stop.cancelled() => break,
+                    p = Arc::clone(&semaphore).acquire_owned() => p.unwrap(),
+                };
+                let tx = tx.clone();
+                let router = Arc::clone(&router);
+                inflight.spawn(async move {
+                    let _permit = permit;
+                    let response = router.handle(cmd);
+                    if let Err(e) = tx.send(response).await {
+                        eprintln!("{}", e);
                     }
                 });
-
-
-                while let Some(frame) = stream.next().await {
-                    match frame {
-                        Ok(cmd) => {
-                            let semaphore_clone = Arc::clone(&semaphore);
-                            let tx_clone = tx.clone();
-                            let router_clone = Arc::clone(&router);
-                            let permit = semaphore_clone.acquire_owned().await.unwrap();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let response = router_clone.handle(cmd);
-                                if let Err(e) = tx_clone.send(response).await {
-                                    eprintln!("{}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("{:?}", e);
-                            break;
-                        }
-                    }
-                }
-            });
+            }
+            Err(e) => {
+                eprintln!("{:?}", e);
+                break;
+            }
         }
+    }
+
+    inflight.close();
+    tokio::select! { _ = inflight.wait() => {}, _ = kill.cancelled() => {} }
+    drop(tx);
+    if kill.is_cancelled() {
+        writer.abort();
+    } else {
+        let _ = writer.await;
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            while let Some(Ok(_)) = stream.next().await {}
+        }).await;
     }
 }

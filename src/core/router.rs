@@ -43,7 +43,7 @@ impl Router {
         }
         match self.routes.get(&frame.route) {
             Some(handler) => { 
-                let mut response = Response::new(&frame.headers.req_id);
+                let mut response = Response::new(frame.headers.req_id);
                 handler(frame, &mut response);
                 response
             },

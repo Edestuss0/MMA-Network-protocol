@@ -78,6 +78,7 @@ pub enum ResponseOpcode {
     Conflict = 6,
     InternalError = 7,
     Message = 8,
+    Shutdown = 9
 }
 
 #[derive(Debug)]
@@ -89,15 +90,27 @@ pub struct Response {
 
 
 impl Response {
-    pub fn new(req_id: &u32) -> Self {
+    pub fn new(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders{
                 version: MMA_VERSION,
-                req_id: *req_id,
+                req_id: req_id,
                 opcode: ResponseOpcode::Ok
             },
             payload: Bytes::from("Empty response"),
-            options: Vec::new(),
+            options: vec![],
+        }
+    }
+    
+    pub fn graceful_shutdown_response(req_id: u32) -> Self {
+        Self {
+            headers: ResponseHeaders{
+                version: MMA_VERSION,
+                req_id: req_id,
+                opcode: ResponseOpcode::Shutdown
+            },
+            payload: Bytes::from("Server has been closed"),
+            options: vec![]
         }
     }
 }
