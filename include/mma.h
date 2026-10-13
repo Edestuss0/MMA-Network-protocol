@@ -49,6 +49,7 @@ typedef struct {
     uint8_t max_batch;
     uint32_t max_in_flight;
     MMA_FramerConfig framer;
+    uint32_t max_connections;
 } MMA_ServerConfig;
 
 typedef struct {
@@ -95,6 +96,8 @@ int32_t mma_server_route(
     void *user_data
 );
 int32_t mma_server_start(MMA_Server *server);
+int32_t mma_server_stop(MMA_Server *server);
+void mma_server_destroy(MMA_Server *server);
 
 int32_t mma_response_set_status(MMA_Response *response, uint8_t opcode);
 int32_t mma_response_set_payload(

@@ -1,20 +1,21 @@
 use crate::core::commands::Response;
 use crate::core::config::Config;
+use crate::core::config::FramerConfig;
 use crate::core::router::Router;
 use crate::protocol::framer::Framer;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{io, panic};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tokio::net::TcpStream;
-use crate::core::config::FramerConfig;
-use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio_util::codec::Framed;
-
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -47,6 +48,10 @@ impl Server {
         self.stop.clone()
     }
 
+    pub fn shutdown_server(&self) {
+        self.stop.cancel();
+    }
+
     fn validate_config(config: &Config) -> Result<(), io::Error> {
         if config.frame_config.validate().is_err() || config.max_in_flight == 0 {
             return Err(io::Error::new(
@@ -62,7 +67,10 @@ impl Server {
 
     pub async fn run(&mut self, router: Router) -> Result<(), std::io::Error> {
         println!("Server listen on {} now", self.config.address);
-        self.run_until(router, async { let _ = tokio::signal::ctrl_c().await; }).await
+        self.run_until(router, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
     }
 
     pub async fn run_until<F: Future<Output = ()>>(
@@ -78,8 +86,11 @@ impl Server {
         let mut result = Ok(());
         tokio::pin!(shutdown);
 
+        let conns_semaphore = Arc::new(Semaphore::new(self.config.max_connections as usize));
+
         loop {
-            let socket = tokio::select! {
+            let conns_semaphore = Arc::clone(&conns_semaphore);
+            let mut socket = tokio::select! {
                 _ = &mut shutdown => break,
                 _ = stop.cancelled() => break,
                 acc = self.tcp_listener.accept() => match acc {
@@ -87,6 +98,14 @@ impl Server {
                     Err(e) => { result = Err(e); break; }
                 },
             };
+            let permit = match conns_semaphore.try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    socket.shutdown().await;
+                    continue;
+                }
+            };
+
             let _ = socket.set_nodelay(true);
             conns.spawn(serve_connection(
                 socket,
@@ -96,12 +115,16 @@ impl Server {
                 Arc::clone(&semaphore),
                 stop.clone(),
                 kill.clone(),
+                permit,
             ));
         }
 
         stop.cancel();
         conns.close();
-        if tokio::time::timeout(SHUTDOWN_GRACE, conns.wait()).await.is_err() {
+        if tokio::time::timeout(SHUTDOWN_GRACE, conns.wait())
+            .await
+            .is_err()
+        {
             eprintln!("graceful shutdown: grace period expired, killing connections");
             kill.cancel();
             conns.wait().await;
@@ -118,11 +141,14 @@ async fn serve_connection(
     semaphore: Arc<Semaphore>,
     stop: CancellationToken,
     kill: CancellationToken,
+    conn_permit: OwnedSemaphorePermit,
 ) {
     let framed = Framed::new(socket, Framer::new(frame_config));
     let (mut sink, mut stream) = framed.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
     let inflight = TaskTracker::new();
+
+    let conn_semaphore = Arc::new(Semaphore::new(256));
 
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -159,22 +185,41 @@ async fn serve_connection(
         };
         match frame {
             Ok(cmd) => {
-                let permit = tokio::select! {
+                let (permit_global, permit_local) = tokio::select! {
                     _ = stop.cancelled() => break,
-                    p = Arc::clone(&semaphore).acquire_owned() => p.unwrap(),
+                    per = Arc::clone(&conn_semaphore).acquire_owned() => {
+                        let permit_local = Arc::clone(&semaphore).acquire_owned().await;
+                        (per.unwrap(), permit_local.unwrap())
+                    }
                 };
                 let tx = tx.clone();
                 let router = Arc::clone(&router);
+                let req_id = cmd.headers.req_id;
                 inflight.spawn(async move {
-                    let _permit = permit;
-                    let response = router.handle(cmd);
+                    let permit = (permit_global, permit_local);
+                    let response =
+                        match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+                            Ok(r) => r,
+                            Err(_) => Response::internal_error(req_id),
+                        };
+
+                    drop(permit);
+
                     if let Err(e) = tx.send(response).await {
                         eprintln!("{}", e);
                     }
                 });
             }
-            Err(e) => {
-                eprintln!("{:?}", e);
+            Err(error) => {
+                if let Err(e) = tx
+                    .send(Response::bad_request(
+                        0,
+                        Some(Bytes::from(error.to_string())),
+                    ))
+                    .await
+                {
+                    eprintln!("Error with sending to socket: {:?}", e);
+                }
                 break;
             }
         }
@@ -183,12 +228,14 @@ async fn serve_connection(
     inflight.close();
     tokio::select! { _ = inflight.wait() => {}, _ = kill.cancelled() => {} }
     drop(tx);
+    drop(conn_permit);
     if kill.is_cancelled() {
         writer.abort();
     } else {
         let _ = writer.await;
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
             while let Some(Ok(_)) = stream.next().await {}
-        }).await;
+        })
+        .await;
     }
 }

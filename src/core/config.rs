@@ -1,11 +1,44 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub address: SocketAddr,
     pub frame_config: FramerConfig,
     pub max_batch: u8,
-    pub max_in_flight: u32
+    pub max_in_flight: u32,
+    pub max_connections: u32,
+}
+
+impl Config {
+    pub fn default() -> Self {
+        Self {
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
+            frame_config: FramerConfig::new(),
+            max_batch: 255,
+            max_in_flight: 1024,
+            max_connections: 128_000,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ()> {
+        if self.max_connections == 0 {
+            return Err(());
+        }
+
+        if self.max_batch == 0 {
+            return Err(());
+        }
+
+        if self.max_in_flight == 0 {
+            return Err(());
+        }
+
+        if self.address.port() == 0 {
+            return Err(());
+        }
+
+        Result::Ok(())
+    }
 }
 
 pub const MMA_VERSION: u8 = 1;
@@ -58,7 +91,7 @@ impl FramerConfig {
             }
         }
 
-        Ok(())
+        Result::Ok(())
     }
     pub fn new() -> Self {
         Self {
@@ -73,5 +106,11 @@ impl FramerConfig {
             options_key_first: true,
             header_length: MIN_HEADER_LEN + RESERVED_SUFFIX,
         }
+    }
+}
+
+impl Default for FramerConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }

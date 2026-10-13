@@ -4,9 +4,6 @@ use MMA::core::server::Server;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::thread;
-use std::thread::sleep;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -25,7 +22,8 @@ async fn main() {
             header_length: 29,
         },
         max_batch: 255,
-        max_in_flight: 1024
+        max_in_flight: 1024,
+        max_connections: 128_000,
     };
 
     let mut router = Router::new();
@@ -51,7 +49,7 @@ async fn main() {
             let payload = frame.payload.clone();
             let number = match std::str::from_utf8(&payload) {
                 Ok(value) => value,
-                Err(_) => "2"
+                Err(_) => "2",
             }
             .parse::<i32>()
             .unwrap_or(1);
@@ -65,5 +63,5 @@ async fn main() {
         }),
     );
 
-    let _ = server.run(router).await;
+    server.run(router).await;
 }

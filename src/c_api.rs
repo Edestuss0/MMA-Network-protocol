@@ -5,11 +5,12 @@ use crate::core::config::{Config, FramerConfig};
 use crate::core::router::Router;
 use crate::core::server::Server;
 use std::ffi::{CStr, c_char, c_void};
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 pub const MMA_OK: i32 = 0;
 pub const MMA_INVALID_ARGUMENT: i32 = -1;
@@ -40,6 +41,7 @@ pub struct MMA_ServerConfig {
     pub max_batch: u8,
     pub max_in_flight: u32,
     pub framer: MMA_FramerConfig,
+    pub max_connections: u32,
 }
 
 #[repr(C)]
@@ -83,6 +85,8 @@ pub struct MMA_Server {
     bound_port: u16,
     routes: Vec<RegisteredRoute>,
     started: bool,
+    stop: CancellationToken,
+    thread: Option<JoinHandle<()>>,
 }
 
 fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
@@ -116,6 +120,24 @@ fn framer_config_to_c(config: &FramerConfig) -> MMA_FramerConfig {
         options_key_first: u8::from(config.options_key_first),
         header_length: config.header_length,
     }
+}
+
+fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
+    let ip_str = unsafe { CStr::from_ptr(config.bind_ip) }.to_str().ok()?;
+    let ip_addr = Ipv4Addr::from_str(ip_str).ok()?;
+
+    Some(Config {
+        address: SocketAddr::new(IpAddr::V4(ip_addr), config.port),
+        frame_config: match framer_config_from_c(config.framer) {
+            Some(c) => c,
+            None => {
+                return None;
+            }
+        },
+        max_batch: config.max_batch,
+        max_connections: config.max_connections,
+        max_in_flight: config.max_in_flight,
+    })
 }
 
 fn valid_slice<T>(data: *const T, len: usize) -> bool {
@@ -203,7 +225,7 @@ unsafe fn response_mut<'a>(response: *mut MMA_Response) -> Result<&'a mut Respon
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig) -> i32 {
+pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig) -> i32 {
     if output.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
@@ -214,6 +236,7 @@ pub extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig) -> i3
         max_batch: 16,
         max_in_flight: 1024,
         framer: framer_config_to_c(&framer),
+        max_connections: 128_000,
     };
     unsafe {
         *output = config;
@@ -247,24 +270,23 @@ pub unsafe extern "C" fn mma_server_create(
         Ok(value) => value,
         Err(_) => return MMA_INVALID_ARGUMENT,
     };
-    let Some(frame_config) = framer_config_from_c(config.framer) else {
+
+    let Some(rust_config) = config_from_c(&config) else {
         return MMA_INVALID_CONFIG;
     };
-    if frame_config.validate().is_err() || config.max_in_flight == 0 {
+
+    if rust_config.frame_config.validate().is_err() || rust_config.validate().is_err() {
         return MMA_INVALID_CONFIG;
     }
 
-    let address = SocketAddr::new(ip, config.port);;
+    let address = SocketAddr::new(ip, config.port);
     let server = MMA_Server {
-        config: Config {
-            address,
-            frame_config,
-            max_batch: config.max_batch,
-            max_in_flight: config.max_in_flight,
-        },
+        config: rust_config,
         bound_port: address.port(),
         routes: Vec::new(),
         started: false,
+        stop: CancellationToken::new(),
+        thread: None,
     };
     unsafe {
         *output = Box::into_raw(Box::new(server));
@@ -317,7 +339,8 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
     let config = server.config.clone();
     let router = router_from_routes(&server.routes);
 
-    let _ = match thread::Builder::new()
+    let stop = server.stop.clone();
+    let thread = match thread::Builder::new()
         .name("mma-server".to_owned())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -330,14 +353,21 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
                 }
             };
             runtime.block_on(async move {
-                let mut server = match Server::new(config).await {
-                    Ok(server) => server,
-                    Err(_) => {
+                let listener = match tokio::net::TcpListener::bind(config.address).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("MMA server bind failed: {error}");
                         return;
                     }
                 };
-                if let Err(error) = server.run(router).await
-                {
+                let mut server = match Server::from_listener(config, listener) {
+                    Ok(server) => server,
+                    Err(error) => {
+                        eprintln!("MMA server initialization failed: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = server.run_until(router, stop.cancelled()).await {
                     eprintln!("MMA server stopped after an error: {error}");
                 }
             });
@@ -345,7 +375,8 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
         Ok(thread) => thread,
         Err(_) => return MMA_SERVER_ERROR,
     };
-
+    server.thread = Some(thread);
+    server.started = true;
     MMA_OK
 }
 
@@ -359,30 +390,29 @@ pub unsafe extern "C" fn mma_server_local_port(server: *const MMA_Server, port: 
     }
     MMA_OK
 }
-//
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn mma_server_stop(server: *mut MMA_Server) -> i32 {
-//     if server.is_null() {
-//         return MMA_INVALID_ARGUMENT;
-//     }
-//     let server = unsafe { &mut *server };
-//     let Some(running) = server.running.take() else {
-//         return MMA_OK;
-//     };
-//     let _ = running.shutdown.send(());
-//     if running.thread.join().is_err() {
-//         return MMA_SERVER_ERROR;
-//     }
-//     MMA_OK
-// }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_stop(server: *mut MMA_Server) -> i32 {
+    if server.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+    let server = unsafe { &mut *server };
+    let Some(thread) = server.thread.take() else {
+        return MMA_OK;
+    };
+    server.stop.cancel();
+    if thread.join().is_err() {
+        return MMA_SERVER_ERROR;
+    }
+    MMA_OK
+}
 
-// #[unsafe(no_mangle)]
-// pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
-//     if !server.is_null() {
-//         let _ = unsafe { mma_server_stop(server) };
-//         drop(unsafe { Box::from_raw(server) });
-//     }
-// }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
+    if !server.is_null() {
+        let _ = unsafe { mma_server_stop(server) };
+        drop(unsafe { Box::from_raw(server) });
+    }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_set_status(response: *mut MMA_Response, opcode: u8) -> i32 {
@@ -448,4 +478,41 @@ pub unsafe extern "C" fn mma_response_add_option(
     }
     response.options.push((key.to_owned(), value.to_owned()));
     MMA_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_usable() {
+        let mut config = std::mem::MaybeUninit::uninit();
+        assert_eq!(mma_server_config_default(config.as_mut_ptr()), MMA_OK);
+        let config = unsafe { config.assume_init() };
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.max_connections, 128_000);
+        assert!(
+            framer_config_from_c(config.framer)
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn null_arguments_are_rejected() {
+        assert_eq!(
+            mma_server_config_default(ptr::null_mut()),
+            MMA_INVALID_ARGUMENT
+        );
+        let mut server = ptr::null_mut();
+        assert_eq!(
+            unsafe { mma_server_create(ptr::null(), &mut server) },
+            MMA_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { mma_server_stop(ptr::null_mut()) },
+            MMA_INVALID_ARGUMENT
+        );
+    }
 }

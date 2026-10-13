@@ -135,6 +135,7 @@ int main(void)
     config.port = 8080;
     config.max_batch = 255;
     config.max_in_flight = 1024;
+    config.max_connections = 128000;
     config.framer.opcode_pos = 1;
     config.framer.version_pos = 4;
     config.framer.max_message_length = 10 * 1000 * 1000;
@@ -187,6 +188,9 @@ int main(void)
     while (running) {
         /* Wait for SIGINT or SIGTERM. */
     }
+
+    mma_server_stop(server);
+    mma_server_destroy(server);
 
     return 0;
 }

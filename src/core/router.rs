@@ -23,30 +23,30 @@ impl Router {
 
     fn validate_version(frame: &Request) -> Result<(), Response> {
         if frame.headers.version != MMA_VERSION {
-            return Err(Response{
-                headers: ResponseHeaders{
+            return Err(Response {
+                headers: ResponseHeaders {
                     version: MMA_VERSION,
                     opcode: ResponseOpcode::BadRequest,
-                    req_id: frame.headers.req_id
+                    req_id: frame.headers.req_id,
                 },
                 payload: Bytes::from("Incorrect protocol version"),
                 options: Vec::new(),
-            })
+            });
         }
 
-        return Ok(())
+        Ok(())
     }
 
     pub fn handle(&self, frame: Request) -> Response {
         if let Err(e) = Self::validate_version(&frame) {
-            return e
+            return e;
         }
         match self.routes.get(&frame.route) {
-            Some(handler) => { 
+            Some(handler) => {
                 let mut response = Response::new(frame.headers.req_id);
                 handler(frame, &mut response);
                 response
-            },
+            }
             None => Response {
                 headers: ResponseHeaders {
                     version: MMA_VERSION,
@@ -57,5 +57,11 @@ impl Router {
                 options: vec![],
             },
         }
+    }
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
     }
 }

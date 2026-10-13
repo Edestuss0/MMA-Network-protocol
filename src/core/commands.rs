@@ -78,7 +78,7 @@ pub enum ResponseOpcode {
     Conflict = 6,
     InternalError = 7,
     Message = 8,
-    Shutdown = 9
+    Shutdown = 9,
 }
 
 #[derive(Debug)]
@@ -88,29 +88,55 @@ pub struct Response {
     pub options: Vec<(String, String)>,
 }
 
-
 impl Response {
     pub fn new(req_id: u32) -> Self {
         Self {
-            headers: ResponseHeaders{
+            headers: ResponseHeaders {
                 version: MMA_VERSION,
-                req_id: req_id,
-                opcode: ResponseOpcode::Ok
+                req_id,
+                opcode: ResponseOpcode::Ok,
             },
             payload: Bytes::from("Empty response"),
             options: vec![],
         }
     }
-    
+
     pub fn graceful_shutdown_response(req_id: u32) -> Self {
         Self {
-            headers: ResponseHeaders{
+            headers: ResponseHeaders {
                 version: MMA_VERSION,
-                req_id: req_id,
-                opcode: ResponseOpcode::Shutdown
+                req_id,
+                opcode: ResponseOpcode::Shutdown,
             },
             payload: Bytes::from("Server has been closed"),
-            options: vec![]
+            options: vec![],
+        }
+    }
+
+    pub fn internal_error(req_id: u32) -> Self {
+        Self {
+            headers: ResponseHeaders {
+                version: MMA_VERSION,
+                req_id,
+                opcode: ResponseOpcode::InternalError,
+            },
+            payload: Bytes::from("Internal server error"),
+            options: vec![],
+        }
+    }
+
+    pub fn bad_request(req_id: u32, payload: Option<Bytes>) -> Self {
+        Self {
+            headers: ResponseHeaders {
+                version: MMA_VERSION,
+                req_id,
+                opcode: ResponseOpcode::BadRequest,
+            },
+            payload: match payload {
+                Some(p) => p,
+                None => Bytes::from("Bad request"),
+            },
+            options: vec![],
         }
     }
 }
