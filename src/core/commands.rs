@@ -1,4 +1,10 @@
-use crate::core::config::MMA_VERSION;
+use crate::core::{
+    commands::ResponseOpcode::{
+        BadRequest, ChannelConnected, ChannelMessage, Conflict, Forbidden, InternalError, NotFound,
+        Ok, Shutdown, Unauthorized,
+    },
+    config::MMA_VERSION,
+};
 use bytes::Bytes;
 use std::io;
 use thiserror::Error;
@@ -21,10 +27,11 @@ pub struct RequestHeaders {
     pub req_id: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestOpcode {
     Once = 2,
-    Channel = 1,
+    ChannelConnect = 1,
+    ChannelMessage = 3,
 }
 
 impl TryFrom<u8> for RequestOpcode {
@@ -32,8 +39,9 @@ impl TryFrom<u8> for RequestOpcode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            2 => Ok(RequestOpcode::Once),
-            1 => Ok(RequestOpcode::Channel),
+            2 => Result::Ok(RequestOpcode::Once),
+            1 => Result::Ok(RequestOpcode::ChannelConnect),
+            3 => Result::Ok(RequestOpcode::ChannelMessage),
             _ => Err(()),
         }
     }
@@ -77,8 +85,27 @@ pub enum ResponseOpcode {
     NotFound = 5,
     Conflict = 6,
     InternalError = 7,
-    Message = 8,
+    ChannelMessage = 8,
     Shutdown = 9,
+    ChannelConnected = 10,
+}
+
+impl ResponseOpcode {
+    pub fn from_number(number: u8) -> Option<Self> {
+        match number {
+            1 => Some(Ok),
+            2 => Some(BadRequest),
+            3 => Some(Unauthorized),
+            4 => Some(Forbidden),
+            5 => Some(NotFound),
+            6 => Some(Conflict),
+            7 => Some(InternalError),
+            8 => Some(ChannelMessage),
+            9 => Some(Shutdown),
+            10 => Some(ChannelConnected),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -136,6 +163,30 @@ impl Response {
                 Some(p) => p,
                 None => Bytes::from("Bad request"),
             },
+            options: vec![],
+        }
+    }
+
+    pub fn connection_type_mismatch(req_id: u32) -> Self {
+        Self {
+            headers: ResponseHeaders {
+                version: MMA_VERSION,
+                req_id,
+                opcode: ResponseOpcode::BadRequest,
+            },
+            payload: Bytes::from("Connection type mismatch"),
+            options: vec![],
+        }
+    }
+
+    pub fn channel_connected(req_id: u32) -> Self {
+         Self {
+            headers: ResponseHeaders {
+                version: MMA_VERSION,
+                req_id,
+                opcode: ResponseOpcode::ChannelConnected,
+            },
+            payload: Bytes::from("Channel connected successfully"),
             options: vec![],
         }
     }

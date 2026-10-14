@@ -1,4 +1,6 @@
+use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
+use crate::core::commands::ResponseOpcode::Ok;
 use crate::core::config::Config;
 use crate::core::config::FramerConfig;
 use crate::core::router::Router;
@@ -7,6 +9,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use std::{io, panic};
 use tokio::io::AsyncWriteExt;
@@ -37,7 +40,7 @@ impl Server {
         tcp_listener: TcpListener,
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
-        Ok(Self {
+        Result::Ok(Self {
             config,
             tcp_listener,
             stop: CancellationToken::new(),
@@ -59,7 +62,7 @@ impl Server {
                 "invalid server configuration",
             ));
         }
-        Ok(())
+        Result::Ok(())
     }
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
         self.tcp_listener.local_addr()
@@ -83,23 +86,26 @@ impl Server {
         let stop = self.stop.clone();
         let kill = CancellationToken::new();
         let conns = TaskTracker::new();
-        let mut result = Ok(());
+        let mut result = Result::Ok(());
         tokio::pin!(shutdown);
 
         let conns_semaphore = Arc::new(Semaphore::new(self.config.max_connections as usize));
 
+        let current_channel_connection_id: Arc<RwLock<u32>> = Arc::new(RwLock::new(0));
+
         loop {
             let conns_semaphore = Arc::clone(&conns_semaphore);
+            let current_channel_connection_id = Arc::clone(&current_channel_connection_id);
             let mut socket = tokio::select! {
                 _ = &mut shutdown => break,
                 _ = stop.cancelled() => break,
                 acc = self.tcp_listener.accept() => match acc {
-                    Ok((socket, _)) => socket,
-                    Err(e) => { result = Err(e); break; }
+                    Result::Ok((socket, _)) => socket,
+                    Result::Err(e) => { result = Err(e); break; }
                 },
             };
             let permit = match conns_semaphore.try_acquire_owned() {
-                Ok(p) => p,
+                Result::Ok(p) => p,
                 Err(_) => {
                     socket.shutdown().await;
                     continue;
@@ -107,6 +113,11 @@ impl Server {
             };
 
             let _ = socket.set_nodelay(true);
+
+            let conn_id: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
+            let conn_id_for_closure = Arc::clone(&conn_id); 
+            let is_channel = Arc::new(RwLock::new(false));
+            let is_channel_for_closure = Arc::clone(&is_channel);
             conns.spawn(serve_connection(
                 socket,
                 Arc::clone(&router),
@@ -116,6 +127,47 @@ impl Server {
                 stop.clone(),
                 kill.clone(),
                 permit,
+                conn_id,
+                is_channel,
+                move || {
+                    let current_id = match current_channel_connection_id.read() {
+                        Result::Ok(i) => *i,
+                        Err(_) => {
+                            return Err(());
+                        }
+                    };
+                    let current_channel_guard = current_channel_connection_id.write();
+                    let conn_id_guard = conn_id_for_closure.write();
+                    let is_channel_guard = is_channel_for_closure.write();
+
+                    if !current_channel_guard.is_err() && !conn_id_guard.is_err() && !is_channel_guard.is_err() {
+                        *current_channel_guard.unwrap() += 1;
+                        *conn_id_guard.unwrap() = Some(current_id + 1);
+                        *is_channel_guard.unwrap() = true;
+                    } else {
+                        return Err(());
+                    }
+
+                    let id = match conn_id_for_closure.read() {
+                        Result::Ok(i) => match *i {
+                            Some(p) => p,
+                            None => {
+                                return Err(());
+                            }
+                        },
+                        Err(_) => {
+                            return Err(())
+                        }
+                    };
+                    let connected = match is_channel_for_closure.read() {
+                        Result::Ok(i) => *i,
+                        Err(_) => {
+                            return Err(());
+                        }
+                    };
+
+                    Result::Ok((id, connected))
+                },
             ));
         }
 
@@ -133,7 +185,7 @@ impl Server {
     }
 }
 
-async fn serve_connection(
+async fn serve_connection<F>(
     socket: TcpStream,
     router: Arc<Router>,
     frame_config: FramerConfig,
@@ -142,7 +194,12 @@ async fn serve_connection(
     stop: CancellationToken,
     kill: CancellationToken,
     conn_permit: OwnedSemaphorePermit,
-) {
+    conn_id: Arc<RwLock<Option<u32>>>,
+    is_channel: Arc<RwLock<bool>>,
+    on_channel_connect: F,
+) where
+    F: Fn() -> Result<(u32, bool), ()> + Send + Sync + 'static,
+{
     let framed = Framed::new(socket, Framer::new(frame_config));
     let (mut sink, mut stream) = framed.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
@@ -159,7 +216,7 @@ async fn serve_connection(
             let mut count = 1;
             while count < max_batch {
                 match rx.try_recv() {
-                    Ok(x) => {
+                    Result::Ok(x) => {
                         if sink.feed(x).await.is_err() {
                             return;
                         }
@@ -176,6 +233,8 @@ async fn serve_connection(
         let _ = sink.close().await;
     });
 
+    let on_channel_connect = Arc::new(on_channel_connect);
+
     loop {
         let frame = tokio::select! {
             biased;
@@ -183,8 +242,11 @@ async fn serve_connection(
             _ = stop.cancelled() => break,
             f = stream.next() => match f { Some(f) => f, None => break },
         };
+
+        let is_channel = Arc::clone(&is_channel);
+
         match frame {
-            Ok(cmd) => {
+            Result::Ok(cmd) => {
                 let (permit_global, permit_local) = tokio::select! {
                     _ = stop.cancelled() => break,
                     per = Arc::clone(&conn_semaphore).acquire_owned() => {
@@ -192,14 +254,62 @@ async fn serve_connection(
                         (per.unwrap(), permit_local.unwrap())
                     }
                 };
+
                 let tx = tx.clone();
                 let router = Arc::clone(&router);
+                let conn_id = Arc::clone(&conn_id);
                 let req_id = cmd.headers.req_id;
+
+                let on_channel_connect = Arc::clone(&on_channel_connect);                
+
                 inflight.spawn(async move {
                     let permit = (permit_global, permit_local);
+
+                    let mut is_channel_val = {
+                        let guard = is_channel.read().unwrap();
+                        *guard
+                    };
+
+                    let mut conn_id_val = {
+                        let guard = conn_id.read().unwrap();
+                        *guard
+                    };
+
+                    if cmd.headers.opcode != RequestOpcode::ChannelConnect
+                        && cmd.headers.opcode != RequestOpcode::ChannelMessage
+                        && is_channel_val
+                    {
+                        if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
+                            eprintln!("{}", e);
+                        }
+                        return;
+                    }
+
+                    if cmd.headers.opcode == RequestOpcode::ChannelConnect
+                        && !is_channel_val
+                        && conn_id_val == None
+                    {
+                        match on_channel_connect() {
+                            Result::Ok((id, connected)) => {
+                                is_channel_val = connected;
+                                conn_id_val = Some(id);
+                                if let Err(e) = tx.send(Response::channel_connected(req_id)).await {
+                                    eprintln!("{}", e);
+                                }
+                                println!("{}, {:?}", is_channel_val, conn_id_val);
+                            }
+                            Err(_) => {
+                                if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Failed to connect channel")))).await {
+                                    eprintln!("{}", e);
+                                }
+                            }
+                        }
+                        return;
+                    }
+
                     let response =
                         match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
-                            Ok(r) => r,
+                            Result::Ok(r) => r,
                             Err(_) => Response::internal_error(req_id),
                         };
 
@@ -234,7 +344,7 @@ async fn serve_connection(
     } else {
         let _ = writer.await;
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
-            while let Some(Ok(_)) = stream.next().await {}
+            while let Some(Result::Ok(_)) = stream.next().await {}
         })
         .await;
     }

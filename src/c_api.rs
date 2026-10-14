@@ -153,20 +153,6 @@ unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
     }
 }
 
-fn response_opcode(opcode: u8) -> Option<ResponseOpcode> {
-    match opcode {
-        1 => Some(ResponseOpcode::Ok),
-        2 => Some(ResponseOpcode::BadRequest),
-        3 => Some(ResponseOpcode::Unauthorized),
-        4 => Some(ResponseOpcode::Forbidden),
-        5 => Some(ResponseOpcode::NotFound),
-        6 => Some(ResponseOpcode::Conflict),
-        7 => Some(ResponseOpcode::InternalError),
-        8 => Some(ResponseOpcode::Message),
-        _ => None,
-    }
-}
-
 fn router_from_routes(routes: &[RegisteredRoute]) -> Router {
     let mut router = Router::new();
     for route in routes {
@@ -416,7 +402,7 @@ pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_set_status(response: *mut MMA_Response, opcode: u8) -> i32 {
-    let Some(opcode) = response_opcode(opcode) else {
+    let Some(opcode) = ResponseOpcode::from_number(opcode) else {
         return MMA_INVALID_ARGUMENT;
     };
     let response = match unsafe { response_mut(response) } {
@@ -487,7 +473,10 @@ mod tests {
     #[test]
     fn default_config_is_usable() {
         let mut config = std::mem::MaybeUninit::uninit();
-        assert_eq!(mma_server_config_default(config.as_mut_ptr()), MMA_OK);
+        assert_eq!(
+            unsafe { mma_server_config_default(config.as_mut_ptr()) },
+            MMA_OK
+        );
         let config = unsafe { config.assume_init() };
         assert_eq!(config.port, 8080);
         assert_eq!(config.max_connections, 128_000);
@@ -502,7 +491,7 @@ mod tests {
     #[test]
     fn null_arguments_are_rejected() {
         assert_eq!(
-            mma_server_config_default(ptr::null_mut()),
+            unsafe { mma_server_config_default(ptr::null_mut()) },
             MMA_INVALID_ARGUMENT
         );
         let mut server = ptr::null_mut();

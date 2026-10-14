@@ -2,9 +2,16 @@ use crate::core::commands::{Request, Response, ResponseHeaders, ResponseOpcode};
 use crate::core::config::MMA_VERSION;
 use ahash::AHashMap;
 use bytes::Bytes;
+use std::str::FromStr;
 use std::sync::Arc;
+use strum_macros::EnumString;
 
 pub type Handler = Arc<dyn Fn(Request, &mut Response) + Send + Sync>;
+
+#[derive(Debug, PartialEq, EnumString)]
+enum ReservedRoutes {
+    CHANNEL_CONNECT,
+}
 
 #[derive(Clone)]
 pub struct Router {
@@ -17,8 +24,12 @@ impl Router {
             routes: AHashMap::new(),
         }
     }
-    pub fn register_route(&mut self, route: String, handler: Handler) {
+    pub fn register_route(&mut self, route: String, handler: Handler) -> Result<(), ()> {
+        if let Ok(_) = ReservedRoutes::from_str(route.to_uppercase().as_str()) {
+            return Err(());
+        }
         self.routes.insert(route, handler);
+        return Ok(());
     }
 
     fn validate_version(frame: &Request) -> Result<(), Response> {

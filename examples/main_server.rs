@@ -36,32 +36,44 @@ async fn main() {
         }
     };
 
-    router.register_route(
-        "GET".to_string(),
-        Arc::new(move |request, res| {
-            res.payload = request.payload;
-        }),
-    );
+    if router
+        .register_route(
+            "GET".to_string(),
+            Arc::new(move |request, res| {
+                res.payload = request.payload;
+            }),
+        )
+        .is_err()
+    {
+        eprint!("Invalid route");
+        panic!();
+    }
 
-    router.register_route(
-        "POW".to_string(),
-        Arc::new(move |frame, res| {
-            let payload = frame.payload.clone();
-            let number = match std::str::from_utf8(&payload) {
-                Ok(value) => value,
-                Err(_) => "2",
-            }
-            .parse::<i32>()
-            .unwrap_or(1);
-            let pow: u32 = match frame.options.iter().find(|x| x.0 == "pow") {
-                Some(value) => value.1.parse().unwrap_or_else(|_| 2),
-                None => 2,
-            };
-            let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
+    if router
+        .register_route(
+            "POW".to_string(),
+            Arc::new(move |frame, res| {
+                let payload = frame.payload.clone();
+                let number = match std::str::from_utf8(&payload) {
+                    Ok(value) => value,
+                    Err(_) => "2",
+                }
+                .parse::<i32>()
+                .unwrap_or(1);
+                let pow: u32 = match frame.options.iter().find(|x| x.0 == "pow") {
+                    Some(value) => value.1.parse().unwrap_or_else(|_| 2),
+                    None => 2,
+                };
+                let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
 
-            res.payload = Bytes::from(response);
-        }),
-    );
+                res.payload = Bytes::from(response);
+            }),
+        )
+        .is_err()
+    {
+        eprint!("Invalid route");
+        panic!();
+    }
 
     server.run(router).await;
 }
