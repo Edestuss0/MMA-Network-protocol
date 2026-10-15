@@ -8,6 +8,8 @@ use strum_macros::EnumString;
 
 pub type Handler = Arc<dyn Fn(Request, &mut Response) + Send + Sync>;
 
+pub type ChannelHandler = Arc<dyn Fn(Request, &u32) + Send + Sync>;
+
 #[derive(Debug, PartialEq, EnumString)]
 enum ReservedRoutes {
     CHANNEL_CONNECT,
@@ -16,20 +18,30 @@ enum ReservedRoutes {
 #[derive(Clone)]
 pub struct Router {
     routes: AHashMap<String, Handler>,
+    channel_handlers: AHashMap<String, ChannelHandler>
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
             routes: AHashMap::new(),
+            channel_handlers: AHashMap::new(),
         }
     }
     pub fn register_route(&mut self, route: String, handler: Handler) -> Result<(), ()> {
-        if let Ok(_) = ReservedRoutes::from_str(route.to_uppercase().as_str()) {
+        if let Result::Ok(_) = ReservedRoutes::from_str(route.to_uppercase().as_str()) {
             return Err(());
         }
         self.routes.insert(route, handler);
-        return Ok(());
+        return Result::Ok(());
+    }
+
+    pub fn register_channel_handler(&mut self, route: String, handler: ChannelHandler) -> Result<(), ()> {
+        if let Result::Ok(_) = ReservedRoutes::from_str(route.to_uppercase().as_str()) {
+            return Err(());
+        }
+        self.channel_handlers.insert(route, handler);
+        return Result::Ok(());
     }
 
     fn validate_version(frame: &Request) -> Result<(), Response> {
@@ -45,7 +57,7 @@ impl Router {
             });
         }
 
-        Ok(())
+        Result::Ok(())
     }
 
     pub fn handle(&self, frame: Request) -> Response {
@@ -67,6 +79,27 @@ impl Router {
                 payload: Bytes::from("No such method"),
                 options: vec![],
             },
+        }
+    }
+
+    pub fn handle_channel(&self, frame: Request, conn_id: &u32) -> Result<(), Response> {
+        if let Err(e) = Self::validate_version(&frame) {
+            return Err(e);
+        }
+        match self.channel_handlers.get(&frame.route) {
+            Some(handler) => {
+                handler(frame, conn_id);
+                Result::Ok(())
+            }
+            None => Err(Response {
+                headers: ResponseHeaders {
+                    version: MMA_VERSION,
+                    opcode: ResponseOpcode::NotFound,
+                    req_id: frame.headers.req_id,
+                },
+                payload: Bytes::from("No such method"),
+                options: vec![],
+            }),
         }
     }
 }

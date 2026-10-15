@@ -1,12 +1,14 @@
+use crate::core::commands::ChannelSendedMessage;
 use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
-use crate::core::commands::ResponseOpcode::Ok;
 use crate::core::config::Config;
 use crate::core::config::FramerConfig;
 use crate::core::router::Router;
 use crate::protocol::framer::Framer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::Receiver;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -22,11 +24,27 @@ use tokio_util::task::TaskTracker;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug,)]
 pub struct Server {
     config: Config,
     tcp_listener: TcpListener,
     stop: CancellationToken,
+    channel_sender: broadcast::Sender<ChannelSendedMessage>,
 }
+
+pub struct ServerHandle {
+    channel_sender: broadcast::Sender<ChannelSendedMessage>,
+}
+
+impl ServerHandle {
+    pub fn send_to_channel(&self, conn_id: u32, message: Response) -> Result<(), ()> {
+        let sender = self.channel_sender.clone();
+        if let Err(_) = sender.send(ChannelSendedMessage { message, conn_id }) {
+            return Err(());
+        }
+        Ok(())
+    }
+} 
 
 impl Server {
     pub async fn new(config: Config) -> Result<Self, std::io::Error> {
@@ -35,15 +53,23 @@ impl Server {
         Self::from_listener(config, listener)
     }
 
+    pub fn handle(&self) -> ServerHandle {
+        ServerHandle {
+            channel_sender: self.channel_sender.clone(),
+        }
+    }
+
     pub fn from_listener(
         config: Config,
         tcp_listener: TcpListener,
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
+        let (channel_sender, _) = broadcast::channel::<ChannelSendedMessage>(1024);
         Result::Ok(Self {
             config,
             tcp_listener,
             stop: CancellationToken::new(),
+            channel_sender,
         })
     }
 
@@ -118,6 +144,8 @@ impl Server {
             let conn_id_for_closure = Arc::clone(&conn_id); 
             let is_channel = Arc::new(RwLock::new(false));
             let is_channel_for_closure = Arc::clone(&is_channel);
+            let channel_receiver = self.channel_sender.subscribe();
+
             conns.spawn(serve_connection(
                 socket,
                 Arc::clone(&router),
@@ -129,6 +157,7 @@ impl Server {
                 permit,
                 conn_id,
                 is_channel,
+                channel_receiver,
                 move || {
                     let current_id = match current_channel_connection_id.read() {
                         Result::Ok(i) => *i,
@@ -196,6 +225,7 @@ async fn serve_connection<F>(
     conn_permit: OwnedSemaphorePermit,
     conn_id: Arc<RwLock<Option<u32>>>,
     is_channel: Arc<RwLock<bool>>,
+    mut channel_receiver: broadcast::Receiver<ChannelSendedMessage>,
     on_channel_connect: F,
 ) where
     F: Fn() -> Result<(u32, bool), ()> + Send + Sync + 'static,
@@ -206,6 +236,46 @@ async fn serve_connection<F>(
     let inflight = TaskTracker::new();
 
     let conn_semaphore = Arc::new(Semaphore::new(256));
+    
+    let tx_copy = tx.clone();
+
+    let conn_id_clone = Arc::clone(&conn_id);
+    let is_channel_clone = Arc::clone(&is_channel);
+
+    let channel_sender = tokio::spawn(async move {
+        while let Ok(message) = channel_receiver.recv().await {
+
+            let conn_id = {
+                let guard = match conn_id_clone.read() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        continue;
+                    }
+                };
+                *guard
+            };
+
+            let is_channel = {
+                let guard = match is_channel_clone.read() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        continue;
+                    }
+                };
+                *guard
+            };
+
+            if !is_channel || conn_id.is_none() {
+                continue;
+            } 
+
+            if message.conn_id == conn_id.unwrap() || message.conn_id == 0 {
+                if let Err(e) = tx_copy.send(message.message).await {
+                    eprintln!("{}", e);
+                }
+            }
+        }
+    });
 
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -275,49 +345,68 @@ async fn serve_connection<F>(
                         *guard
                     };
 
-                    if cmd.headers.opcode != RequestOpcode::ChannelConnect
-                        && cmd.headers.opcode != RequestOpcode::ChannelMessage
-                        && is_channel_val
-                    {
-                        if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
-                            eprintln!("{}", e);
-                        }
-                        return;
-                    }
-
-                    if cmd.headers.opcode == RequestOpcode::ChannelConnect
-                        && !is_channel_val
-                        && conn_id_val == None
-                    {
-                        match on_channel_connect() {
-                            Result::Ok((id, connected)) => {
-                                is_channel_val = connected;
-                                conn_id_val = Some(id);
-                                if let Err(e) = tx.send(Response::channel_connected(req_id)).await {
+                    match cmd.headers.opcode {
+                        RequestOpcode::Once => {
+                            if conn_id_val.is_some() || is_channel_val {
+                                if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
                                     eprintln!("{}", e);
                                 }
-                                println!("{}, {:?}", is_channel_val, conn_id_val);
+                            } 
+
+                            let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+                                Result::Ok(r) => r,
+                                Err(_) => Response::internal_error(req_id),
+                            };
+
+                            if let Err(e) = tx.send(response).await {
+                                eprintln!("{}", e);
                             }
-                            Err(_) => {
-                                if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Failed to connect channel")))).await {
-                                    eprintln!("{}", e);
+                        },
+                        RequestOpcode::ChannelConnect => {
+                            if !is_channel_val && conn_id_val.is_none() {
+                                match on_channel_connect() {
+                                    Result::Ok((id, connected)) => {
+                                        is_channel_val = connected;
+                                        conn_id_val = Some(id);
+                                        if let Err(e) = tx.send(Response::channel_connected(req_id)).await {
+                                            eprintln!("{}", e);
+                                        }
+                                        println!("{}, {:?}", is_channel_val, conn_id_val);
+                                    }
+                                    Err(_) => {
+                                        if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Failed to connect channel")))).await {
+                                            eprintln!("{}", e);
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        return;
-                    }
+                        },
+                        RequestOpcode::ChannelMessage => {
+                            if is_channel_val && conn_id_val.is_some() {
+                                match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle_channel(cmd, &conn_id_val.unwrap()))) {
+                                    Result::Ok(Result::Ok(())) => {
 
-                    let response =
-                        match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
-                            Result::Ok(r) => r,
-                            Err(_) => Response::internal_error(req_id),
-                        };
+                                    },
+                                    Result::Ok(Result::Err(r)) => {
+                                        if let Err(e) = tx.send(r).await {
+                                            eprintln!("{}", e);
+                                        }
+                                    },
+                                    Err(_) => {
+                                        if let Err(e) = tx.send(Response::internal_error(req_id)).await {
+                                            eprintln!("{}", e);
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Connection isn't channel")))).await {
+                                    eprintln!("{}", e);
+                                }       
+                            }
+                        },
+                    };
 
                     drop(permit);
-
-                    if let Err(e) = tx.send(response).await {
-                        eprintln!("{}", e);
-                    }
                 });
             }
             Err(error) => {
@@ -341,6 +430,7 @@ async fn serve_connection<F>(
     drop(conn_permit);
     if kill.is_cancelled() {
         writer.abort();
+        channel_sender.abort();
     } else {
         let _ = writer.await;
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {

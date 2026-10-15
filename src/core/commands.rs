@@ -108,11 +108,17 @@ impl ResponseOpcode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Response {
     pub headers: ResponseHeaders,
     pub payload: Bytes,
     pub options: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelSendedMessage {
+    pub message: Response,
+    pub conn_id: u32
 }
 
 impl Response {

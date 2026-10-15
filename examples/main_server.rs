@@ -1,3 +1,4 @@
+use MMA::core::commands::Response;
 use MMA::core::config::{Config, FramerConfig};
 use MMA::core::router::Router;
 use MMA::core::server::Server;
@@ -71,6 +72,21 @@ async fn main() {
         )
         .is_err()
     {
+        eprint!("Invalid route");
+        panic!();
+    }
+    
+   let handle = server.handle();
+
+    if router.register_channel_handler(String::from("SEND"), Arc::new(move |req, _| {
+        let payload = req.payload.clone();
+        let req_id = req.headers.req_id.clone();
+
+        let mut response = Response::new(0);
+        response.payload = Bytes::from(payload);
+
+        handle.send_to_channel(0, response);
+    })).is_err() {
         eprint!("Invalid route");
         panic!();
     }
