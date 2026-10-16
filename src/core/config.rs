@@ -61,7 +61,7 @@ pub const MIN_HEADER_LEN: u8 = 17;
 pub const RESERVED_SUFFIX: u8 = 12;
 impl FramerConfig {
     pub fn validate(&self) -> Result<(), ()> {
-        if self.header_length < MIN_HEADER_LEN + RESERVED_SUFFIX {
+        if self.header_length < MIN_HEADER_LEN {
             return Err(());
         }
         let poses = [

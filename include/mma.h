@@ -77,6 +77,12 @@ typedef int32_t (*MMA_RouteCallback)(
     void *user_data
 );
 
+typedef int32_t (*MMA_ChannelHandlerCallback)(
+    const MMA_Request *request,
+    uint32_t connection_id,
+    void *user_data
+);
+
 /*
  * Request and option data are borrowed and valid only during the callback.
  * Response data must be set with the response functions so it is copied safely.
@@ -88,6 +94,21 @@ typedef int32_t (*MMA_RouteCallback)(
 int32_t mma_server_config_default(MMA_ServerConfig *output);
 int32_t mma_server_create(const MMA_ServerConfig *config, MMA_Server **output);
 int32_t mma_server_local_port(const MMA_Server *server, uint16_t *port);
+int32_t mma_server_register_route(
+    MMA_Server *server,
+    const uint8_t *route,
+    size_t route_len,
+    MMA_RouteCallback callback,
+    void *user_data
+);
+int32_t mma_server_register_channel_handler(
+    MMA_Server *server,
+    const uint8_t *route,
+    size_t route_len,
+    MMA_ChannelHandlerCallback callback,
+    void *user_data
+);
+/* Backward-compatible alias for mma_server_register_route. */
 int32_t mma_server_route(
     MMA_Server *server,
     const uint8_t *route,

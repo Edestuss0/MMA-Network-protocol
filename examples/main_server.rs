@@ -74,8 +74,8 @@ async fn main() {
     {
         eprint!("Invalid route");
         panic!();
+        
     }
-    
    let handle = server.handle();
 
     if router.register_channel_handler(String::from("SEND"), Arc::new(move |req, _| {

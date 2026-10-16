@@ -73,6 +73,8 @@ pub struct MMA_Response {
 
 pub type MMA_RouteCallback =
     Option<extern "C" fn(*const MMA_Request, *mut MMA_Response, *mut c_void) -> i32>;
+pub type MMA_ChannelHandlerCallback =
+    Option<extern "C" fn(*const MMA_Request, u32, *mut c_void) -> i32>;
 
 struct RegisteredRoute {
     route: String,
@@ -80,10 +82,17 @@ struct RegisteredRoute {
     user_data: usize,
 }
 
+struct RegisteredChannelHandler {
+    route: String,
+    callback: extern "C" fn(*const MMA_Request, u32, *mut c_void) -> i32,
+    user_data: usize,
+}
+
 pub struct MMA_Server {
     config: Config,
     bound_port: u16,
     routes: Vec<RegisteredRoute>,
+    channel_handlers: Vec<RegisteredChannelHandler>,
     started: bool,
     stop: CancellationToken,
     thread: Option<JoinHandle<()>>,
@@ -153,13 +162,16 @@ unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
     }
 }
 
-fn router_from_routes(routes: &[RegisteredRoute]) -> Router {
+fn router_from_registrations(
+    routes: &[RegisteredRoute],
+    channel_handlers: &[RegisteredChannelHandler],
+) -> Router {
     let mut router = Router::new();
     for route in routes {
         let callback = route.callback;
         let route_name = route.route.clone();
         let user_data = route.user_data;
-        router.register_route(
+        if router.register_route(
             route.route.clone(),
             Arc::new(move |request: Request, response: &mut Response| {
                 let options: Vec<MMA_Option> = request
@@ -196,6 +208,39 @@ fn router_from_routes(routes: &[RegisteredRoute]) -> Router {
                     response.headers.opcode = ResponseOpcode::InternalError;
                     response.payload = bytes::Bytes::new();
                     response.options.clear();
+                }
+            }),
+        ).is_err() {
+            continue;
+        }
+    }
+    for handler in channel_handlers {
+        let callback = handler.callback;
+        let route_name = handler.route.clone();
+        let user_data = handler.user_data;
+        let _ = router.register_channel_handler(
+            handler.route.clone(),
+            Arc::new(move |request: Request, conn_id: &u32| {
+                let options: Vec<MMA_Option> = request
+                    .options
+                    .iter()
+                    .map(|(key, value)| MMA_Option {
+                        key: key.as_ptr(), key_len: key.len(),
+                        value: value.as_ptr(), value_len: value.len(),
+                    })
+                    .collect();
+                let request_view = MMA_Request {
+                    route: route_name.as_ptr(), route_len: route_name.len(),
+                    opcode: request.headers.opcode as u8,
+                    version: request.headers.version,
+                    request_id: request.headers.req_id,
+                    payload: request.payload.as_ptr(), payload_len: request.payload.len(),
+                    options: if options.is_empty() { ptr::null() } else { options.as_ptr() },
+                    options_count: options.len(),
+                };
+                let status = callback(&request_view, *conn_id, user_data as *mut c_void);
+                if status != MMA_OK {
+                    eprintln!("MMA channel handler {route_name} callback returned status {status}");
                 }
             }),
         );
@@ -270,6 +315,7 @@ pub unsafe extern "C" fn mma_server_create(
         config: rust_config,
         bound_port: address.port(),
         routes: Vec::new(),
+        channel_handlers: Vec::new(),
         started: false,
         stop: CancellationToken::new(),
         thread: None,
@@ -281,7 +327,7 @@ pub unsafe extern "C" fn mma_server_create(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_route(
+pub unsafe extern "C" fn mma_server_register_route(
     server: *mut MMA_Server,
     route: *const u8,
     route_len: usize,
@@ -314,6 +360,43 @@ pub unsafe extern "C" fn mma_server_route(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_register_channel_handler(
+    server: *mut MMA_Server,
+    route: *const u8,
+    route_len: usize,
+    callback: MMA_ChannelHandlerCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if server.is_null() || !valid_slice(route, route_len) {
+        return MMA_INVALID_ARGUMENT;
+    }
+    let server = unsafe { &mut *server };
+    if server.started || route_len == 0 || route_len > u8::MAX as usize {
+        return if server.started { MMA_SERVER_ALREADY_STARTED } else { MMA_INVALID_ARGUMENT };
+    }
+    let route = match std::str::from_utf8(unsafe { raw_slice(route, route_len) }) {
+        Ok(value) => value,
+        Err(_) => return MMA_INVALID_ARGUMENT,
+    };
+    let Some(callback) = callback else { return MMA_INVALID_ARGUMENT; };
+    server.channel_handlers.push(RegisteredChannelHandler {
+        route: route.to_owned(), callback, user_data: user_data as usize,
+    });
+    MMA_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_route(
+    server: *mut MMA_Server,
+    route: *const u8,
+    route_len: usize,
+    callback: MMA_RouteCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    unsafe { mma_server_register_route(server, route, route_len, callback, user_data) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
     if server.is_null() {
         return MMA_INVALID_ARGUMENT;
@@ -323,7 +406,7 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
         return MMA_SERVER_ALREADY_STARTED;
     }
     let config = server.config.clone();
-    let router = router_from_routes(&server.routes);
+    let router = router_from_registrations(&server.routes, &server.channel_handlers);
 
     let stop = server.stop.clone();
     let thread = match thread::Builder::new()

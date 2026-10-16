@@ -74,7 +74,7 @@ pub struct OptionValue {
     pub value: Bytes,
 }
 
-pub const RESPONSE_OPCODES_COUNT: usize = 8;
+pub const RESPONSE_OPCODES_COUNT: usize = 10;
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Copy)]
 pub enum ResponseOpcode {
@@ -193,6 +193,18 @@ impl Response {
                 opcode: ResponseOpcode::ChannelConnected,
             },
             payload: Bytes::from("Channel connected successfully"),
+            options: vec![],
+        }
+    }
+
+    pub fn conflict(req_id: u32, payload: Bytes) -> Self {
+        Self {
+            headers: ResponseHeaders {
+                version: MMA_VERSION,
+                req_id,
+                opcode: ResponseOpcode::Conflict,
+            },
+            payload: payload,
             options: vec![],
         }
     }

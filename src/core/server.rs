@@ -4,6 +4,7 @@ use crate::core::commands::Response;
 use crate::core::config::Config;
 use crate::core::config::FramerConfig;
 use crate::core::router::Router;
+use crate::core::server::SocketStatus::Fresh;
 use crate::protocol::framer::Framer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +36,9 @@ pub struct Server {
 pub struct ServerHandle {
     channel_sender: broadcast::Sender<ChannelSendedMessage>,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum SocketStatus { Fresh, Once, Channel(u32) }
 
 impl ServerHandle {
     pub fn send_to_channel(&self, conn_id: u32, message: Response) -> Result<(), ()> {
@@ -127,7 +131,7 @@ impl Server {
                 _ = stop.cancelled() => break,
                 acc = self.tcp_listener.accept() => match acc {
                     Result::Ok((socket, _)) => socket,
-                    Result::Err(e) => { result = Err(e); break; }
+                    Result::Err(e) => { result = Err(e); continue; }
                 },
             };
             let permit = match conns_semaphore.try_acquire_owned() {
@@ -141,9 +145,6 @@ impl Server {
             let _ = socket.set_nodelay(true);
 
             let conn_id: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
-            let conn_id_for_closure = Arc::clone(&conn_id); 
-            let is_channel = Arc::new(RwLock::new(false));
-            let is_channel_for_closure = Arc::clone(&is_channel);
             let channel_receiver = self.channel_sender.subscribe();
 
             conns.spawn(serve_connection(
@@ -155,47 +156,37 @@ impl Server {
                 stop.clone(),
                 kill.clone(),
                 permit,
-                conn_id,
-                is_channel,
                 channel_receiver,
                 move || {
                     let current_id = match current_channel_connection_id.read() {
                         Result::Ok(i) => *i,
                         Err(_) => {
-                            return Err(());
+                            return Fresh
                         }
                     };
                     let current_channel_guard = current_channel_connection_id.write();
-                    let conn_id_guard = conn_id_for_closure.write();
-                    let is_channel_guard = is_channel_for_closure.write();
+                    let conn_id_guard = conn_id.write();
 
-                    if !current_channel_guard.is_err() && !conn_id_guard.is_err() && !is_channel_guard.is_err() {
+                    if !current_channel_guard.is_err() && !conn_id_guard.is_err() {
                         *current_channel_guard.unwrap() += 1;
                         *conn_id_guard.unwrap() = Some(current_id + 1);
-                        *is_channel_guard.unwrap() = true;
                     } else {
-                        return Err(());
+                        return Fresh
                     }
 
-                    let id = match conn_id_for_closure.read() {
+                    let id = match conn_id.read() {
                         Result::Ok(i) => match *i {
                             Some(p) => p,
                             None => {
-                                return Err(());
+                                return Fresh
                             }
                         },
                         Err(_) => {
-                            return Err(())
-                        }
-                    };
-                    let connected = match is_channel_for_closure.read() {
-                        Result::Ok(i) => *i,
-                        Err(_) => {
-                            return Err(());
+                            return Fresh
                         }
                     };
 
-                    Result::Ok((id, connected))
+                    SocketStatus::Channel(id)
                 },
             ));
         }
@@ -223,12 +214,10 @@ async fn serve_connection<F>(
     stop: CancellationToken,
     kill: CancellationToken,
     conn_permit: OwnedSemaphorePermit,
-    conn_id: Arc<RwLock<Option<u32>>>,
-    is_channel: Arc<RwLock<bool>>,
     mut channel_receiver: broadcast::Receiver<ChannelSendedMessage>,
     on_channel_connect: F,
 ) where
-    F: Fn() -> Result<(u32, bool), ()> + Send + Sync + 'static,
+    F: Fn() -> SocketStatus + Send + Sync + 'static,
 {
     let framed = Framed::new(socket, Framer::new(frame_config));
     let (mut sink, mut stream) = framed.split();
@@ -236,40 +225,29 @@ async fn serve_connection<F>(
     let inflight = TaskTracker::new();
 
     let conn_semaphore = Arc::new(Semaphore::new(256));
-    
     let tx_copy = tx.clone();
 
-    let conn_id_clone = Arc::clone(&conn_id);
-    let is_channel_clone = Arc::clone(&is_channel);
+    let on_channel_connect = Arc::new(on_channel_connect);
+    let socket_status = Arc::new(RwLock::new(SocketStatus::Fresh));
+    let channel_socket_status = Arc::clone(&socket_status);
 
     let channel_sender = tokio::spawn(async move {
         while let Ok(message) = channel_receiver.recv().await {
-
-            let conn_id = {
-                let guard = match conn_id_clone.read() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        continue;
+            let conn_id = match channel_socket_status.read() {
+                Ok(g) => {
+                    match *g {
+                        SocketStatus::Channel(i) => i,
+                        _ => {
+                            continue;
+                        }
                     }
-                };
-                *guard
+                },
+                Err(_) => {
+                    continue
+                }
             };
 
-            let is_channel = {
-                let guard = match is_channel_clone.read() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        continue;
-                    }
-                };
-                *guard
-            };
-
-            if !is_channel || conn_id.is_none() {
-                continue;
-            } 
-
-            if message.conn_id == conn_id.unwrap() || message.conn_id == 0 {
+            if message.conn_id == conn_id || message.conn_id == 0 {
                 if let Err(e) = tx_copy.send(message.message).await {
                     eprintln!("{}", e);
                 }
@@ -303,8 +281,6 @@ async fn serve_connection<F>(
         let _ = sink.close().await;
     });
 
-    let on_channel_connect = Arc::new(on_channel_connect);
-
     loop {
         let frame = tokio::select! {
             biased;
@@ -313,8 +289,7 @@ async fn serve_connection<F>(
             f = stream.next() => match f { Some(f) => f, None => break },
         };
 
-        let is_channel = Arc::clone(&is_channel);
-
+        
         match frame {
             Result::Ok(cmd) => {
                 let (permit_global, permit_local) = tokio::select! {
@@ -324,89 +299,149 @@ async fn serve_connection<F>(
                         (per.unwrap(), permit_local.unwrap())
                     }
                 };
-
+                
                 let tx = tx.clone();
                 let router = Arc::clone(&router);
-                let conn_id = Arc::clone(&conn_id);
                 let req_id = cmd.headers.req_id;
+                let on_channel_connect = Arc::clone(&on_channel_connect);
+                let socket_status_val = {
+                    let guard = match socket_status.read() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            break;
+                        }
+                    };
+                    *guard
+                };
 
-                let on_channel_connect = Arc::clone(&on_channel_connect);                
+                let socket_status = Arc::clone(&socket_status);
 
                 inflight.spawn(async move {
-                    let permit = (permit_global, permit_local);
-
-                    let mut is_channel_val = {
-                        let guard = is_channel.read().unwrap();
-                        *guard
-                    };
-
-                    let mut conn_id_val = {
-                        let guard = conn_id.read().unwrap();
-                        *guard
-                    };
-
-                    match cmd.headers.opcode {
-                        RequestOpcode::Once => {
-                            if conn_id_val.is_some() || is_channel_val {
-                                if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
-                                    eprintln!("{}", e);
-                                }
-                            } 
-
-                            let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
-                                Result::Ok(r) => r,
-                                Err(_) => Response::internal_error(req_id),
-                            };
-
-                            if let Err(e) = tx.send(response).await {
-                                eprintln!("{}", e);
-                            }
-                        },
-                        RequestOpcode::ChannelConnect => {
-                            if !is_channel_val && conn_id_val.is_none() {
-                                match on_channel_connect() {
-                                    Result::Ok((id, connected)) => {
-                                        is_channel_val = connected;
-                                        conn_id_val = Some(id);
-                                        if let Err(e) = tx.send(Response::channel_connected(req_id)).await {
-                                            eprintln!("{}", e);
+                    match socket_status_val {
+                        SocketStatus::Fresh => {
+                            match cmd.headers.opcode {
+                                RequestOpcode::Once => {
+                                    let lock_result = {
+                                        match socket_status.write() {
+                                            Ok(mut g) => {
+                                                *g = SocketStatus::Once;
+                                                Ok(())
+                                            }
+                                            Err(_) => Err(()),
                                         }
-                                        println!("{}, {:?}", is_channel_val, conn_id_val);
-                                    }
-                                    Err(_) => {
-                                        if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Failed to connect channel")))).await {
-                                            eprintln!("{}", e);
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        RequestOpcode::ChannelMessage => {
-                            if is_channel_val && conn_id_val.is_some() {
-                                match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle_channel(cmd, &conn_id_val.unwrap()))) {
-                                    Result::Ok(Result::Ok(())) => {
+                                    };
 
-                                    },
-                                    Result::Ok(Result::Err(r)) => {
-                                        if let Err(e) = tx.send(r).await {
-                                            eprintln!("{}", e);
-                                        }
-                                    },
-                                    Err(_) => {
+                                    if lock_result.is_err() {
+                                        drop(permit_global);
+
                                         if let Err(e) = tx.send(Response::internal_error(req_id)).await {
                                             eprintln!("{}", e);
                                         }
+
+                                        return;
                                     }
+
+                                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+                                        Result::Ok(r) => r,
+                                        Err(_) => Response::internal_error(req_id),
+                                    };
+
+                                    drop(permit_global);
+
+                                    if let Err(e) = tx.send(response).await {
+                                        eprintln!("{}", e);
+                                    }
+                                    
+                                },
+                                RequestOpcode::ChannelConnect => {
+                                    let lock_result = {
+                                        match socket_status.write() {
+                                            Ok(mut g) => {
+                                                *g = on_channel_connect();
+                                                Ok(())
+                                            }
+                                            Err(_) => Err(()),
+                                        }
+                                    };
+
+                                    if lock_result.is_err() {
+                                        drop(permit_global);
+
+                                        if let Err(e) = tx.send(Response::internal_error(req_id)).await {
+                                            eprintln!("{}", e);
+                                        }
+
+                                        return;
+                                    }
+
+                                    drop(permit_global);
+                                },
+                                RequestOpcode::ChannelMessage => {
+                                    drop(permit_global);
+                                    if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Channel not connected")))).await {
+                                        eprintln!("{}", e);
+                                    }     
                                 }
-                            } else {
-                                if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Connection isn't channel")))).await {
-                                    eprintln!("{}", e);
-                                }       
                             }
                         },
+                        SocketStatus::Once => {
+                            match cmd.headers.opcode {
+                                RequestOpcode::Once => {
+                                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+                                        Result::Ok(r) => r,
+                                        Err(_) => Response::internal_error(req_id),
+                                    };
+
+                                    drop(permit_global);
+
+                                    if let Err(e) = tx.send(response).await {
+                                        eprintln!("{}", e);
+                                    }
+                                },
+                                _ => {
+                                    drop(permit_global);
+                                    if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
+                                        eprintln!("{}", e);
+                                    }
+                                }
+                            }
+                        },
+                        SocketStatus::Channel(conn_id) => {
+                            match cmd.headers.opcode {
+                                RequestOpcode::ChannelConnect => {
+                                    drop(permit_global);
+                                    if let Err(e) = tx.send(Response::conflict(req_id, Bytes::from("Channel already connected"))).await {
+                                        eprintln!("{}", e);
+                                    }
+                                },
+                                RequestOpcode::ChannelMessage => {
+                                    match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle_channel(cmd, &conn_id))) {
+                                        Result::Ok(Result::Err(r)) => {
+                                            drop(permit_global);
+                                            if let Err(e) = tx.send(r).await {
+                                                eprintln!("{}", e);
+                                            }
+                                        },
+                                        Err(_) => {
+                                            drop(permit_global);
+                                            if let Err(e) = tx.send(Response::internal_error(req_id)).await {
+                                                eprintln!("{}", e);
+                                            }
+                                        },
+                                        _ => {}
+                                    }
+                                },
+                                RequestOpcode::Once => {
+                                    drop(permit_global);
+                                    if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
+                                        eprintln!("{}", e);
+                                    }
+                                }
+                            }
+                        } 
                     };
 
-                    drop(permit);
+                    drop(permit_local);
                 });
             }
             Err(error) => {
@@ -428,9 +463,9 @@ async fn serve_connection<F>(
     tokio::select! { _ = inflight.wait() => {}, _ = kill.cancelled() => {} }
     drop(tx);
     drop(conn_permit);
+    channel_sender.abort();
     if kill.is_cancelled() {
         writer.abort();
-        channel_sender.abort();
     } else {
         let _ = writer.await;
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {

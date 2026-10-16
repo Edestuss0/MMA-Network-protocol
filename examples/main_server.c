@@ -122,6 +122,19 @@ static int32_t pow_route(
     );
 }
 
+static int32_t send_channel(
+    const MMA_Request *request,
+    uint32_t connection_id,
+    void *user_data
+)
+{
+    (void)request;
+    (void)connection_id;
+    (void)user_data;
+    /* Channel handlers are registered separately from request/response routes. */
+    return MMA_OK;
+}
+
 int main(void)
 {
     MMA_ServerConfig config;
@@ -155,16 +168,25 @@ int main(void)
     }
 
     static const uint8_t get[] = "GET";
-    result = mma_server_route(server, get, sizeof(get) - 1, get_route, NULL);
+    result = mma_server_register_route(server, get, sizeof(get) - 1, get_route, NULL);
     if (result != MMA_OK) {
         fprintf(stderr, "Could not register GET route: %d\n", result);
         return 1;
     }
 
     static const uint8_t pow[] = "POW";
-    result = mma_server_route(server, pow, sizeof(pow) - 1, pow_route, NULL);
+    result = mma_server_register_route(server, pow, sizeof(pow) - 1, pow_route, NULL);
     if (result != MMA_OK) {
         fprintf(stderr, "Could not register POW route: %d\n", result);
+        return 1;
+    }
+
+    static const uint8_t send[] = "SEND";
+    result = mma_server_register_channel_handler(
+        server, send, sizeof(send) - 1, send_channel, NULL
+    );
+    if (result != MMA_OK) {
+        fprintf(stderr, "Could not register SEND channel handler: %d\n", result);
         return 1;
     }
 
