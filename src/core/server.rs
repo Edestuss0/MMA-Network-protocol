@@ -397,14 +397,18 @@ async fn handle_cmd<F>(cmd: Request, socket_status: Arc<RwLock<SocketStatus>>, p
                                 *g = on_channel_connect();
                                 Ok(())
                             }
-                            Err(_) => Err(()),
+                            Err(_) => {
+                                println!("not connect");
+                                Err(())
+                            },
                         }
                     };
 
                     if lock_result.is_err() {
                         drop(permit);
-
                         return Some(Response::internal_error(req_id));
+                    } else {
+                        return Some(Response::channel_connected(req_id));
                     }
 
                     drop(permit);
