@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use crate::core::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Port};
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub address: SocketAddr,
@@ -8,6 +10,16 @@ pub struct Config {
     pub max_in_flight: u32,
     pub max_connections: u32,
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("max_connections must be > 0")] MaxConnections,
+    #[error("max_in_flight must be > 0")] MaxInFlight,
+    #[error("max_batch must be > 0")] MaxBatch,
+    #[error("invalid framer config")] Framer,
+    #[error("invalid port")] Port
+}
+
 
 impl Config {
     pub fn default() -> Self {
@@ -20,21 +32,25 @@ impl Config {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ()> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_connections == 0 {
-            return Err(());
+            return Err(MaxConnections);
         }
 
         if self.max_batch == 0 {
-            return Err(());
+            return Err(MaxBatch);
         }
 
         if self.max_in_flight == 0 {
-            return Err(());
+            return Err(MaxInFlight);
         }
 
         if self.address.port() == 0 {
-            return Err(());
+            return Err(Port);
+        }
+
+        if self.frame_config.validate().is_err() {
+            return Err(ConfigError::Framer);
         }
 
         Result::Ok(())

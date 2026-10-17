@@ -1,4 +1,5 @@
 use crate::core::commands::ChannelSendedMessage;
+use crate::core::commands::Request;
 use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
 use crate::core::config::Config;
@@ -86,10 +87,10 @@ impl Server {
     }
 
     fn validate_config(config: &Config) -> Result<(), io::Error> {
-        if config.frame_config.validate().is_err() || config.max_in_flight == 0 {
+        if let Err(e) = config.validate() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid server configuration",
+                e,
             ));
         }
         Result::Ok(())
@@ -302,144 +303,15 @@ async fn serve_connection<F>(
                 
                 let tx = tx.clone();
                 let router = Arc::clone(&router);
-                let req_id = cmd.headers.req_id;
                 let on_channel_connect = Arc::clone(&on_channel_connect);
-                let socket_status_val = {
-                    let guard = match socket_status.read() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            break;
-                        }
-                    };
-                    *guard
-                };
-
                 let socket_status = Arc::clone(&socket_status);
 
                 inflight.spawn(async move {
-                    match socket_status_val {
-                        SocketStatus::Fresh => {
-                            match cmd.headers.opcode {
-                                RequestOpcode::Once => {
-                                    let lock_result = {
-                                        match socket_status.write() {
-                                            Ok(mut g) => {
-                                                *g = SocketStatus::Once;
-                                                Ok(())
-                                            }
-                                            Err(_) => Err(()),
-                                        }
-                                    };
-
-                                    if lock_result.is_err() {
-                                        drop(permit_global);
-
-                                        if let Err(e) = tx.send(Response::internal_error(req_id)).await {
-                                            eprintln!("{}", e);
-                                        }
-
-                                        return;
-                                    }
-
-                                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
-                                        Result::Ok(r) => r,
-                                        Err(_) => Response::internal_error(req_id),
-                                    };
-
-                                    drop(permit_global);
-
-                                    if let Err(e) = tx.send(response).await {
-                                        eprintln!("{}", e);
-                                    }
-                                    
-                                },
-                                RequestOpcode::ChannelConnect => {
-                                    let lock_result = {
-                                        match socket_status.write() {
-                                            Ok(mut g) => {
-                                                *g = on_channel_connect();
-                                                Ok(())
-                                            }
-                                            Err(_) => Err(()),
-                                        }
-                                    };
-
-                                    if lock_result.is_err() {
-                                        drop(permit_global);
-
-                                        if let Err(e) = tx.send(Response::internal_error(req_id)).await {
-                                            eprintln!("{}", e);
-                                        }
-
-                                        return;
-                                    }
-
-                                    drop(permit_global);
-                                },
-                                RequestOpcode::ChannelMessage => {
-                                    drop(permit_global);
-                                    if let Err(e) = tx.send(Response::bad_request(req_id, Some(Bytes::from("Channel not connected")))).await {
-                                        eprintln!("{}", e);
-                                    }     
-                                }
-                            }
-                        },
-                        SocketStatus::Once => {
-                            match cmd.headers.opcode {
-                                RequestOpcode::Once => {
-                                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
-                                        Result::Ok(r) => r,
-                                        Err(_) => Response::internal_error(req_id),
-                                    };
-
-                                    drop(permit_global);
-
-                                    if let Err(e) = tx.send(response).await {
-                                        eprintln!("{}", e);
-                                    }
-                                },
-                                _ => {
-                                    drop(permit_global);
-                                    if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
-                                        eprintln!("{}", e);
-                                    }
-                                }
-                            }
-                        },
-                        SocketStatus::Channel(conn_id) => {
-                            match cmd.headers.opcode {
-                                RequestOpcode::ChannelConnect => {
-                                    drop(permit_global);
-                                    if let Err(e) = tx.send(Response::conflict(req_id, Bytes::from("Channel already connected"))).await {
-                                        eprintln!("{}", e);
-                                    }
-                                },
-                                RequestOpcode::ChannelMessage => {
-                                    match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle_channel(cmd, &conn_id))) {
-                                        Result::Ok(Result::Err(r)) => {
-                                            drop(permit_global);
-                                            if let Err(e) = tx.send(r).await {
-                                                eprintln!("{}", e);
-                                            }
-                                        },
-                                        Err(_) => {
-                                            drop(permit_global);
-                                            if let Err(e) = tx.send(Response::internal_error(req_id)).await {
-                                                eprintln!("{}", e);
-                                            }
-                                        },
-                                        _ => {}
-                                    }
-                                },
-                                RequestOpcode::Once => {
-                                    drop(permit_global);
-                                    if let Err(e) = tx.send(Response::connection_type_mismatch(req_id)).await {
-                                        eprintln!("{}", e);
-                                    }
-                                }
-                            }
-                        } 
-                    };
+                    if let Some(r) = handle_cmd(cmd, socket_status, permit_global, router, on_channel_connect).await {
+                        if let Err(e) = tx.send(r).await {
+                            eprintln!("{}", e)
+                        }
+                    }
 
                     drop(permit_local);
                 });
@@ -473,4 +345,120 @@ async fn serve_connection<F>(
         })
         .await;
     }
+}
+
+async fn handle_cmd<F>(cmd: Request, socket_status: Arc<RwLock<SocketStatus>>, permit: OwnedSemaphorePermit, router: Arc<Router>, on_channel_connect: Arc<F>
+) -> Option<Response> where F: Fn() -> SocketStatus + Send + Sync + 'static {
+    let req_id = cmd.headers.req_id;
+    let socket_status_val = {
+        let guard = match socket_status.read() {
+            Ok(g) => g,
+            Err(_) => {
+                return None;
+            }
+        };
+        *guard
+    };
+
+    match socket_status_val {
+        SocketStatus::Fresh => {
+            match cmd.headers.opcode {
+                RequestOpcode::Once => {
+                    let lock_result = {
+                        match socket_status.write() {
+                            Ok(mut g) => {
+                                *g = SocketStatus::Once;
+                                Ok(())
+                            }
+                            Err(_) => Err(()),
+                        }
+                    };
+
+                    if lock_result.is_err() {
+                        drop(permit);
+
+                        return Some(Response::internal_error(req_id));
+                    }
+
+                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+                        Result::Ok(r) => r,
+                        Err(_) => Response::internal_error(req_id),
+                    };
+
+                    drop(permit);
+
+                    return Some(response);
+                    
+                },
+                RequestOpcode::ChannelConnect => {
+                    let lock_result = {
+                        match socket_status.write() {
+                            Ok(mut g) => {
+                                *g = on_channel_connect();
+                                Ok(())
+                            }
+                            Err(_) => Err(()),
+                        }
+                    };
+
+                    if lock_result.is_err() {
+                        drop(permit);
+
+                        return Some(Response::internal_error(req_id));
+                    }
+
+                    drop(permit);
+                },
+                RequestOpcode::ChannelMessage => {
+                    drop(permit);
+                    return Some(Response::bad_request(req_id, Some(Bytes::from("Channel not connected"))));
+                }
+            }
+        },
+        SocketStatus::Once => {
+            match cmd.headers.opcode {
+                RequestOpcode::Once => {
+                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+                        Result::Ok(r) => r,
+                        Err(_) => Response::internal_error(req_id),
+                    };
+
+                    drop(permit);
+
+                    return Some(response);
+                },
+                _ => {
+                    drop(permit);
+                    return Some(Response::connection_type_mismatch(req_id));
+                }
+            }
+        },
+        SocketStatus::Channel(conn_id) => {
+            match cmd.headers.opcode {
+                RequestOpcode::ChannelConnect => {
+                    drop(permit);
+                    return Some(Response::conflict(req_id, Bytes::from("Channel already connected")));
+                },
+                RequestOpcode::ChannelMessage => {
+                    match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle_channel(cmd, &conn_id))) {
+                        Result::Ok(Result::Err(r)) => {
+                            drop(permit);
+                            return Some(r);
+                        },
+                        Err(_) => {
+                            drop(permit);
+                            return Some(Response::internal_error(req_id));
+                        },
+                        _ => {}
+                    }
+                },
+                RequestOpcode::Once => {
+                    drop(permit);
+                    return Some(Response::connection_type_mismatch(req_id))
+                }
+            }
+        } 
+    };
+
+    return None;
 }
