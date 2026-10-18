@@ -6,7 +6,7 @@ use crate::core::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Po
 pub struct Config {
     pub address: SocketAddr,
     pub frame_config: FramerConfig,
-    pub max_batch: u8,
+    pub max_batch: u32,
     pub max_in_flight: u32,
     pub max_connections: u32,
 }

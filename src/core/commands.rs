@@ -13,7 +13,16 @@ pub struct Request {
     pub headers: RequestHeaders,
     pub payload: Bytes,
     pub route: String,
-    pub options: Vec<(String, String)>,
+    pub options: Vec<(Bytes, Bytes)>,
+}
+
+impl Request {
+    pub fn get_option(&self, key: &[u8]) -> Option<Bytes> {
+        match self.options.iter().find(|x| x.0 ==  key) {
+            Some(v) => Some(v.1.to_owned()),
+            None => None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +121,7 @@ impl ResponseOpcode {
 pub struct Response {
     pub headers: ResponseHeaders,
     pub payload: Bytes,
-    pub options: Vec<(String, String)>,
+    pub options: Vec<(Bytes, Bytes)>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +130,7 @@ pub struct ChannelSendedMessage {
     pub conn_id: u32
 }
 
-impl Response {
+impl Response {    
     pub fn new(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {

@@ -46,7 +46,7 @@ typedef struct {
 typedef struct {
     const char *bind_ip;
     uint16_t port;
-    uint8_t max_batch;
+    uint32_t max_batch;
     uint32_t max_in_flight;
     MMA_FramerConfig framer;
     uint32_t max_connections;

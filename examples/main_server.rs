@@ -2,7 +2,7 @@ use MMA::core::commands::Response;
 use MMA::core::config::{Config, FramerConfig};
 use MMA::core::router::Router;
 use MMA::core::server::Server;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -22,8 +22,8 @@ async fn main() {
             options_key_first: true,
             header_length: 29,
         },
-        max_batch: 255,
-        max_in_flight: 1024,
+        max_batch: 65535,
+        max_in_flight: 65535,
         max_connections: 128_000,
     };
 
@@ -53,18 +53,13 @@ async fn main() {
     if router
         .register_route(
             "POW".to_string(),
-            Arc::new(move |frame, res| {
-                let payload = frame.payload.clone();
-                let number = match std::str::from_utf8(&payload) {
-                    Ok(value) => value,
-                    Err(_) => "2",
-                }
-                .parse::<i32>()
-                .unwrap_or(1);
-                let pow: u32 = match frame.options.iter().find(|x| x.0 == "pow") {
-                    Some(value) => value.1.parse().unwrap_or_else(|_| 2),
+            Arc::new(move |req, res| {
+                let number = std::str::from_utf8(&req.payload).ok().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(2); 
+                let pow: u32 = match req.get_option("pow".as_bytes()) {
+                    Some(value) => value.clone().get_u32(),
                     None => 2,
                 };
+
                 let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
 
                 res.payload = Bytes::from(response);
@@ -80,7 +75,6 @@ async fn main() {
 
     if router.register_channel_handler(String::from("SEND"), Arc::new(move |req, _| {
         let payload = req.payload.clone();
-        let req_id = req.headers.req_id.clone();
 
         let mut response = Response::new(0);
         response.payload = Bytes::from(payload);

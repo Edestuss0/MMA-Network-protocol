@@ -10,6 +10,7 @@ use std::ptr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 pub const MMA_OK: i32 = 0;
@@ -38,7 +39,7 @@ pub struct MMA_FramerConfig {
 pub struct MMA_ServerConfig {
     pub bind_ip: *const c_char,
     pub port: u16,
-    pub max_batch: u8,
+    pub max_batch: u32,
     pub max_in_flight: u32,
     pub framer: MMA_FramerConfig,
     pub max_connections: u32,
@@ -545,7 +546,7 @@ pub unsafe extern "C" fn mma_response_add_option(
     if response.options.len() >= u8::MAX as usize {
         return MMA_INVALID_ARGUMENT;
     }
-    response.options.push((key.to_owned(), value.to_owned()));
+    response.options.push((Bytes::from(key), Bytes::from(value)));
     MMA_OK
 }
 

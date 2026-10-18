@@ -5,7 +5,6 @@ use crate::core::commands::Response;
 use crate::core::config::Config;
 use crate::core::config::FramerConfig;
 use crate::core::router::Router;
-use crate::core::server::SocketStatus::Fresh;
 use crate::protocol::framer::Framer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -14,6 +13,9 @@ use tokio::sync::mpsc::Receiver;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::{io, panic};
 use tokio::io::AsyncWriteExt;
@@ -40,6 +42,27 @@ pub struct ServerHandle {
 
 #[derive(Debug, Clone, Copy)]
 enum SocketStatus { Fresh, Once, Channel(u32) }
+
+impl SocketStatus {
+    fn to_u64(self) -> u64 {
+        match self {
+            SocketStatus::Fresh => 0,
+            SocketStatus::Once => 1,
+            SocketStatus::Channel(id) => (2 << 32) | (id as u64),
+        }
+    }
+
+    fn from_u64(val: u64) -> Self {
+        let tag = val >> 32;
+        match tag {
+            0 => SocketStatus::Fresh,
+            1 => SocketStatus::Once,
+            2 => SocketStatus::Channel(val as u32),
+            _ => unreachable!(),
+        }
+    }
+}
+
 
 impl ServerHandle {
     pub fn send_to_channel(&self, conn_id: u32, message: Response) -> Result<(), ()> {
@@ -122,7 +145,7 @@ impl Server {
 
         let conns_semaphore = Arc::new(Semaphore::new(self.config.max_connections as usize));
 
-        let current_channel_connection_id: Arc<RwLock<u32>> = Arc::new(RwLock::new(0));
+        let current_channel_connection_id: Arc<AtomicU32> = Arc::new(AtomicU32::new(1));
 
         loop {
             let conns_semaphore = Arc::clone(&conns_semaphore);
@@ -145,7 +168,7 @@ impl Server {
 
             let _ = socket.set_nodelay(true);
 
-            let conn_id: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
+            // let conn_id: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
             let channel_receiver = self.channel_sender.subscribe();
 
             conns.spawn(serve_connection(
@@ -159,35 +182,9 @@ impl Server {
                 permit,
                 channel_receiver,
                 move || {
-                    let current_id = match current_channel_connection_id.read() {
-                        Result::Ok(i) => *i,
-                        Err(_) => {
-                            return Fresh
-                        }
-                    };
-                    let current_channel_guard = current_channel_connection_id.write();
-                    let conn_id_guard = conn_id.write();
-
-                    if !current_channel_guard.is_err() && !conn_id_guard.is_err() {
-                        *current_channel_guard.unwrap() += 1;
-                        *conn_id_guard.unwrap() = Some(current_id + 1);
-                    } else {
-                        return Fresh
-                    }
-
-                    let id = match conn_id.read() {
-                        Result::Ok(i) => match *i {
-                            Some(p) => p,
-                            None => {
-                                return Fresh
-                            }
-                        },
-                        Err(_) => {
-                            return Fresh
-                        }
-                    };
-
-                    SocketStatus::Channel(id)
+                    let conn_id =  current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
+                    println!("connect, {}", conn_id);
+                    SocketStatus::Channel(conn_id)
                 },
             ));
         }
@@ -210,7 +207,7 @@ async fn serve_connection<F>(
     socket: TcpStream,
     router: Arc<Router>,
     frame_config: FramerConfig,
-    max_batch: u8,
+    max_batch: u32,
     semaphore: Arc<Semaphore>,
     stop: CancellationToken,
     kill: CancellationToken,
@@ -229,23 +226,14 @@ async fn serve_connection<F>(
     let tx_copy = tx.clone();
 
     let on_channel_connect = Arc::new(on_channel_connect);
-    let socket_status = Arc::new(RwLock::new(SocketStatus::Fresh));
+    let socket_status = Arc::new(AtomicU64::new(SocketStatus::to_u64(SocketStatus::Fresh)));
     let channel_socket_status = Arc::clone(&socket_status);
 
     let channel_sender = tokio::spawn(async move {
         while let Ok(message) = channel_receiver.recv().await {
-            let conn_id = match channel_socket_status.read() {
-                Ok(g) => {
-                    match *g {
-                        SocketStatus::Channel(i) => i,
-                        _ => {
-                            continue;
-                        }
-                    }
-                },
-                Err(_) => {
-                    continue
-                }
+            let conn_id = match SocketStatus::from_u64(channel_socket_status.load(Ordering::Relaxed)) {
+                SocketStatus::Channel(x) => x,
+                _ => continue
             };
 
             if message.conn_id == conn_id || message.conn_id == 0 {
@@ -293,7 +281,7 @@ async fn serve_connection<F>(
         
         match frame {
             Result::Ok(cmd) => {
-                let (permit_global, permit_local) = tokio::select! {
+                let (permit_local, permit_global) = tokio::select! {
                     _ = stop.cancelled() => break,
                     per = Arc::clone(&conn_semaphore).acquire_owned() => {
                         let permit_local = Arc::clone(&semaphore).acquire_owned().await;
@@ -312,8 +300,8 @@ async fn serve_connection<F>(
                             eprintln!("{}", e)
                         }
                     }
-
                     drop(permit_local);
+
                 });
             }
             Err(error) => {
@@ -347,38 +335,21 @@ async fn serve_connection<F>(
     }
 }
 
-async fn handle_cmd<F>(cmd: Request, socket_status: Arc<RwLock<SocketStatus>>, permit: OwnedSemaphorePermit, router: Arc<Router>, on_channel_connect: Arc<F>
+async fn handle_cmd<F>(cmd: Request, socket_status: Arc<AtomicU64>, permit: OwnedSemaphorePermit, router: Arc<Router>, on_channel_connect: Arc<F>
 ) -> Option<Response> where F: Fn() -> SocketStatus + Send + Sync + 'static {
     let req_id = cmd.headers.req_id;
-    let socket_status_val = {
-        let guard = match socket_status.read() {
-            Ok(g) => g,
-            Err(_) => {
-                return None;
-            }
-        };
-        *guard
-    };
 
-    match socket_status_val {
+    match SocketStatus::from_u64(socket_status.load(Ordering::Relaxed)) {
         SocketStatus::Fresh => {
             match cmd.headers.opcode {
                 RequestOpcode::Once => {
-                    let lock_result = {
-                        match socket_status.write() {
-                            Ok(mut g) => {
-                                *g = SocketStatus::Once;
-                                Ok(())
-                            }
-                            Err(_) => Err(()),
-                        }
-                    };
+                    socket_status.store(SocketStatus::to_u64(SocketStatus::Once), Ordering::Relaxed);
 
-                    if lock_result.is_err() {
-                        drop(permit);
+                    // if lock_result.is_err() {
+                    //     drop(permit);
 
-                        return Some(Response::internal_error(req_id));
-                    }
+                    //     return Some(Response::internal_error(req_id));
+                    // }
 
                     let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
                         Result::Ok(r) => r,
@@ -391,27 +362,9 @@ async fn handle_cmd<F>(cmd: Request, socket_status: Arc<RwLock<SocketStatus>>, p
                     
                 },
                 RequestOpcode::ChannelConnect => {
-                    let lock_result = {
-                        match socket_status.write() {
-                            Ok(mut g) => {
-                                *g = on_channel_connect();
-                                Ok(())
-                            }
-                            Err(_) => {
-                                println!("not connect");
-                                Err(())
-                            },
-                        }
-                    };
-
-                    if lock_result.is_err() {
-                        drop(permit);
-                        return Some(Response::internal_error(req_id));
-                    } else {
-                        return Some(Response::channel_connected(req_id));
-                    }
-
+                    socket_status.store(SocketStatus::to_u64(on_channel_connect()), Ordering::Relaxed);
                     drop(permit);
+                    return Some(Response::channel_connected(req_id));
                 },
                 RequestOpcode::ChannelMessage => {
                     drop(permit);

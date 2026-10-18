@@ -130,7 +130,7 @@ impl Decoder for Framer {
 
         let mut payload = Bytes::new();
         let mut route = String::new();
-        let mut options: Vec<(String, String)> = Vec::with_capacity(headers.options_count as usize);
+        let mut options: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.options_count as usize);
 
         for i in 1..=3 {
             if self.config.options_order == i {
@@ -157,16 +157,13 @@ impl Decoder for Framer {
 const MIN_OPTION_LENGTH: usize = 2 + 2 + 1 + 1;
 
 fn encode_options(
-    options: &Vec<(String, String)>,
+    options: &Vec<(Bytes, Bytes)>,
     config: &FramerConfig,
     dst: &mut BytesMut,
 ) -> Result<u32, ProtocolError> {
     let start = dst.len();
 
     for (key, value) in options {
-        let key = key.as_bytes();
-        let value = value.as_bytes();
-
         if key.is_empty() || value.is_empty() {
             return Err(ProtocolError::InvalidFrame("Option can be empty"));
         }
@@ -194,8 +191,9 @@ fn decode_options(
     mut raw: BytesMut,
     config: &FramerConfig,
     headers: &RequestHeaders,
-) -> Result<Vec<(String, String)>, ProtocolError> {
-    if headers.options_count == 0 {
+) -> Result<Vec<(Bytes, Bytes)>, ProtocolError> {
+    let count = headers.options_count as usize;
+    if count == 0 {
         if !raw.is_empty() {
             return Err(ProtocolError::InvalidFrame("Invalid options format"));
         }
@@ -204,38 +202,31 @@ fn decode_options(
     if raw.len() < MIN_OPTION_LENGTH {
         return Err(ProtocolError::InvalidFrame("Invalid options format"));
     }
-    let mut options: Vec<(String, String)> = Vec::with_capacity(headers.options_count as usize);
+    let mut options: Vec<(Bytes, Bytes)> = Vec::with_capacity(count);
 
-    for _ in 1..=headers.options_count {
+    let mut raw: Bytes = raw.freeze();
+
+    for _ in 1..=count {
         if raw.len() < MIN_OPTION_LENGTH {
             return Err(ProtocolError::InvalidFrame("Invalid options format"));
         }
         let key_count: u16 = raw.get_u16();
         let value_count: u16 = raw.get_u16();
 
-        let key: String;
-        let value: String;
-
         if raw.len() < key_count as usize + value_count as usize {
             return Err(ProtocolError::InvalidFrame("Invalid options format"));
         }
 
-        if config.options_key_first {
-            let key_bytes = raw.split_to(key_count as usize);
-            key = String::from_utf8(key_bytes.into())
-                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
-            let value_bytes = raw.split_to(value_count as usize);
-            value = String::from_utf8(value_bytes.into())
-                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
+        let data: (Bytes, Bytes) = if config.options_key_first {
+            let k = raw.split_to(key_count as usize);
+            let v = raw.split_to(value_count as usize);
+            (k, v)
         } else {
-            let value_bytes = raw.split_to(value_count as usize);
-            value = String::from_utf8(value_bytes.into())
-                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
-            let key_bytes = raw.split_to(key_count as usize);
-            key = String::from_utf8(key_bytes.into())
-                .map_err(|_| ProtocolError::InvalidFrame("Invalid options format"))?;
-        }
-        options.push((key, value));
+            let k = raw.split_to(value_count as usize);
+            let v = raw.split_to(key_count as usize);
+            (k, v)
+        };
+        options.push(data);
     }
 
     if !raw.is_empty() {

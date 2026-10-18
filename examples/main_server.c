@@ -146,8 +146,8 @@ int main(void)
 
     config.bind_ip = "0.0.0.0";
     config.port = 8080;
-    config.max_batch = 255;
-    config.max_in_flight = 1024;
+    config.max_batch = 65535;
+    config.max_in_flight = 65535;
     config.max_connections = 128000;
     config.framer.opcode_pos = 1;
     config.framer.version_pos = 4;
