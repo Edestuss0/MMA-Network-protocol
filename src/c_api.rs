@@ -4,13 +4,14 @@ use crate::core::commands::{Request, Response, ResponseOpcode};
 use crate::core::config::{Config, FramerConfig};
 use crate::core::router::Router;
 use crate::core::server::Server;
+use bytes::Bytes;
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use bytes::Bytes;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub const MMA_OK: i32 = 0;
@@ -43,6 +44,12 @@ pub struct MMA_ServerConfig {
     pub max_in_flight: u32,
     pub framer: MMA_FramerConfig,
     pub max_connections: u32,
+    /// Graceful connection drain timeout, in milliseconds.
+    pub drain_timeout_ms: u64,
+    /// Maximum time allowed for server shutdown, in milliseconds.
+    pub shutdown_grace_ms: u64,
+    /// Maximum time allowed for handling one request, in milliseconds.
+    pub request_timeout_ms: u64,
 }
 
 #[repr(C)]
@@ -147,6 +154,9 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
         max_batch: config.max_batch,
         max_connections: config.max_connections,
         max_in_flight: config.max_in_flight,
+        drain_timeout: Duration::from_millis(config.drain_timeout_ms),
+        shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
+        request_timeout: Duration::from_millis(config.request_timeout_ms),
     })
 }
 
@@ -172,9 +182,60 @@ fn router_from_registrations(
         let callback = route.callback;
         let route_name = route.route.clone();
         let user_data = route.user_data;
-        if router.register_route(
-            route.route.clone(),
-            Arc::new(move |request: Request, response: &mut Response| {
+        if router
+            .register_route(
+                route.route.clone(),
+                Arc::new(move |request: Request, response: &mut Response| {
+                    let options: Vec<MMA_Option> = request
+                        .options
+                        .iter()
+                        .map(|(key, value)| MMA_Option {
+                            key: key.as_ptr(),
+                            key_len: key.len(),
+                            value: value.as_ptr(),
+                            value_len: value.len(),
+                        })
+                        .collect();
+                    let request_view = MMA_Request {
+                        route: route_name.as_ptr(),
+                        route_len: route_name.len(),
+                        opcode: request.headers.opcode as u8,
+                        version: request.headers.version,
+                        request_id: request.headers.req_id,
+                        payload: request.payload.as_ptr(),
+                        payload_len: request.payload.len(),
+                        options: if options.is_empty() {
+                            ptr::null()
+                        } else {
+                            options.as_ptr()
+                        },
+                        options_count: options.len(),
+                    };
+                    let mut response_view = MMA_Response {
+                        response: response as *mut Response,
+                    };
+                    let status =
+                        callback(&request_view, &mut response_view, user_data as *mut c_void);
+                    if status != MMA_OK {
+                        eprintln!("MMA route {route_name} callback returned status {status}");
+                        response.headers.opcode = ResponseOpcode::InternalError;
+                        response.payload = bytes::Bytes::new();
+                        response.options.clear();
+                    }
+                }),
+            )
+            .is_err()
+        {
+            continue;
+        }
+    }
+    for handler in channel_handlers {
+        let callback = handler.callback;
+        let route_name = handler.route.clone();
+        let user_data = handler.user_data;
+        let _ = router.register_channel_handler(
+            handler.route.clone(),
+            Arc::new(move |request: Request, conn_id: &u32| {
                 let options: Vec<MMA_Option> = request
                     .options
                     .iter()
@@ -198,45 +259,6 @@ fn router_from_registrations(
                     } else {
                         options.as_ptr()
                     },
-                    options_count: options.len(),
-                };
-                let mut response_view = MMA_Response {
-                    response: response as *mut Response,
-                };
-                let status = callback(&request_view, &mut response_view, user_data as *mut c_void);
-                if status != MMA_OK {
-                    eprintln!("MMA route {route_name} callback returned status {status}");
-                    response.headers.opcode = ResponseOpcode::InternalError;
-                    response.payload = bytes::Bytes::new();
-                    response.options.clear();
-                }
-            }),
-        ).is_err() {
-            continue;
-        }
-    }
-    for handler in channel_handlers {
-        let callback = handler.callback;
-        let route_name = handler.route.clone();
-        let user_data = handler.user_data;
-        let _ = router.register_channel_handler(
-            handler.route.clone(),
-            Arc::new(move |request: Request, conn_id: &u32| {
-                let options: Vec<MMA_Option> = request
-                    .options
-                    .iter()
-                    .map(|(key, value)| MMA_Option {
-                        key: key.as_ptr(), key_len: key.len(),
-                        value: value.as_ptr(), value_len: value.len(),
-                    })
-                    .collect();
-                let request_view = MMA_Request {
-                    route: route_name.as_ptr(), route_len: route_name.len(),
-                    opcode: request.headers.opcode as u8,
-                    version: request.headers.version,
-                    request_id: request.headers.req_id,
-                    payload: request.payload.as_ptr(), payload_len: request.payload.len(),
-                    options: if options.is_empty() { ptr::null() } else { options.as_ptr() },
                     options_count: options.len(),
                 };
                 let status = callback(&request_view, *conn_id, user_data as *mut c_void);
@@ -269,6 +291,9 @@ pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig
         max_in_flight: 1024,
         framer: framer_config_to_c(&framer),
         max_connections: 128_000,
+        drain_timeout_ms: 2_000,
+        shutdown_grace_ms: 10_000,
+        request_timeout_ms: 10_000,
     };
     unsafe {
         *output = config;
@@ -373,15 +398,23 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
     }
     let server = unsafe { &mut *server };
     if server.started || route_len == 0 || route_len > u8::MAX as usize {
-        return if server.started { MMA_SERVER_ALREADY_STARTED } else { MMA_INVALID_ARGUMENT };
+        return if server.started {
+            MMA_SERVER_ALREADY_STARTED
+        } else {
+            MMA_INVALID_ARGUMENT
+        };
     }
     let route = match std::str::from_utf8(unsafe { raw_slice(route, route_len) }) {
         Ok(value) => value,
         Err(_) => return MMA_INVALID_ARGUMENT,
     };
-    let Some(callback) = callback else { return MMA_INVALID_ARGUMENT; };
+    let Some(callback) = callback else {
+        return MMA_INVALID_ARGUMENT;
+    };
     server.channel_handlers.push(RegisteredChannelHandler {
-        route: route.to_owned(), callback, user_data: user_data as usize,
+        route: route.to_owned(),
+        callback,
+        user_data: user_data as usize,
     });
     MMA_OK
 }
@@ -546,7 +579,9 @@ pub unsafe extern "C" fn mma_response_add_option(
     if response.options.len() >= u8::MAX as usize {
         return MMA_INVALID_ARGUMENT;
     }
-    response.options.push((Bytes::from(key), Bytes::from(value)));
+    response
+        .options
+        .push((Bytes::from(key), Bytes::from(value)));
     MMA_OK
 }
 
@@ -564,12 +599,32 @@ mod tests {
         let config = unsafe { config.assume_init() };
         assert_eq!(config.port, 8080);
         assert_eq!(config.max_connections, 128_000);
+        assert_eq!(config.drain_timeout_ms, 2_000);
+        assert_eq!(config.shutdown_grace_ms, 10_000);
+        assert_eq!(config.request_timeout_ms, 10_000);
         assert!(
             framer_config_from_c(config.framer)
                 .unwrap()
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn duration_options_are_converted_to_rust_config() {
+        let mut config = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { mma_server_config_default(config.as_mut_ptr()) },
+            MMA_OK
+        );
+        let mut config = unsafe { config.assume_init() };
+        config.drain_timeout_ms = 125;
+        config.shutdown_grace_ms = 4_500;
+        config.request_timeout_ms = 0;
+        let rust_config = config_from_c(&config).expect("default bind address is valid");
+        assert_eq!(rust_config.drain_timeout, Duration::from_millis(125));
+        assert_eq!(rust_config.shutdown_grace, Duration::from_millis(4_500));
+        assert_eq!(rust_config.request_timeout, Duration::ZERO);
     }
 
     #[test]

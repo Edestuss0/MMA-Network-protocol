@@ -45,7 +45,7 @@ fn framer_config_accepts_minimum_header_and_permutations() {
 
 #[test]
 fn framer_config_rejects_bad_header_positions() {
-    let base = FramerConfig{
+    let base = FramerConfig {
         header_length: MIN_HEADER_LEN + RESERVED_SUFFIX - 1,
         opcode_pos: 1,
         version_pos: 1,
@@ -55,7 +55,7 @@ fn framer_config_rejects_bad_header_positions() {
         options_key_first: false,
         options_order: 1,
         payload_order: 2,
-        route_order: 1
+        route_order: 1,
     };
     assert!(base.validate().is_err());
 }

@@ -50,6 +50,10 @@ typedef struct {
     uint32_t max_in_flight;
     MMA_FramerConfig framer;
     uint32_t max_connections;
+    /* Timeouts are expressed in milliseconds. */
+    uint64_t drain_timeout_ms;
+    uint64_t shutdown_grace_ms;
+    uint64_t request_timeout_ms;
 } MMA_ServerConfig;
 
 typedef struct {

@@ -9,25 +9,22 @@ use crate::core::router::Router;
 use crate::protocol::framer::Framer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::broadcast;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::{io, panic};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Debug,)]
+#[derive(Debug)]
 pub struct Server {
     config: Config,
     tcp_listener: TcpListener,
@@ -40,7 +37,11 @@ pub struct ServerHandle {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SocketStatus { Fresh, Once, Channel(u32) }
+enum SocketStatus {
+    Fresh,
+    Once,
+    Channel(u32),
+}
 
 impl SocketStatus {
     fn to_u64(self) -> u64 {
@@ -62,7 +63,6 @@ impl SocketStatus {
     }
 }
 
-
 impl ServerHandle {
     pub fn send_to_channel(&self, conn_id: u32, message: Response) -> Result<(), ()> {
         let sender = self.channel_sender.clone();
@@ -71,7 +71,7 @@ impl ServerHandle {
         }
         Ok(())
     }
-} 
+}
 
 impl Server {
     pub async fn new(config: Config) -> Result<Self, std::io::Error> {
@@ -110,10 +110,7 @@ impl Server {
 
     fn validate_config(config: &Config) -> Result<(), io::Error> {
         if let Err(e) = config.validate() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                e,
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
         }
         Result::Ok(())
     }
@@ -171,15 +168,14 @@ impl Server {
             conns.spawn(serve_connection(
                 socket,
                 Arc::clone(&router),
-                self.config.frame_config.clone(),
-                self.config.max_batch,
+                self.config.clone(),
                 Arc::clone(&semaphore),
                 stop.clone(),
                 kill.clone(),
                 permit,
                 channel_receiver,
                 move || {
-                    let conn_id =  current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
+                    let conn_id = current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
                     println!("connect, {}", conn_id);
                     SocketStatus::Channel(conn_id)
                 },
@@ -188,7 +184,7 @@ impl Server {
 
         stop.cancel();
         conns.close();
-        if tokio::time::timeout(SHUTDOWN_GRACE, conns.wait())
+        if tokio::time::timeout(self.config.shutdown_grace, conns.wait())
             .await
             .is_err()
         {
@@ -203,8 +199,7 @@ impl Server {
 async fn serve_connection<F>(
     socket: TcpStream,
     router: Arc<Router>,
-    frame_config: FramerConfig,
-    max_batch: u32,
+    config: Config,
     semaphore: Arc<Semaphore>,
     stop: CancellationToken,
     kill: CancellationToken,
@@ -214,7 +209,7 @@ async fn serve_connection<F>(
 ) where
     F: Fn() -> SocketStatus + Send + Sync + 'static,
 {
-    let framed = Framed::new(socket, Framer::new(frame_config));
+    let framed = Framed::new(socket, Framer::new(config.frame_config));
     let (mut sink, mut stream) = framed.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Response>(1000);
     let inflight = TaskTracker::new();
@@ -228,15 +223,17 @@ async fn serve_connection<F>(
 
     let channel_sender = tokio::spawn(async move {
         while let Ok(message) = channel_receiver.recv().await {
-            let conn_id = match SocketStatus::from_u64(channel_socket_status.load(Ordering::Relaxed)) {
-                SocketStatus::Channel(x) => x,
-                _ => continue
-            };
+            let conn_id =
+                match SocketStatus::from_u64(channel_socket_status.load(Ordering::Relaxed)) {
+                    SocketStatus::Channel(x) => x,
+                    _ => continue,
+                };
 
             if (message.conn_id == conn_id || message.conn_id == 0)
-                && let Err(e) = tx_copy.send(message.message).await {
-                    eprintln!("{}", e);
-                }
+                && let Err(e) = tx_copy.send(message.message).await
+            {
+                eprintln!("{}", e);
+            }
         }
     });
 
@@ -247,7 +244,7 @@ async fn serve_connection<F>(
                 return;
             }
             let mut count = 1;
-            while count < max_batch {
+            while count < config.max_batch {
                 match rx.try_recv() {
                     Result::Ok(x) => {
                         if sink.feed(x).await.is_err() {
@@ -274,7 +271,6 @@ async fn serve_connection<F>(
             f = stream.next() => match f { Some(f) => f, None => break },
         };
 
-        
         match frame {
             Result::Ok(cmd) => {
                 let permit = tokio::select! {
@@ -284,17 +280,33 @@ async fn serve_connection<F>(
                         (per.unwrap(), permit_local.unwrap())
                     }
                 };
-                
+
                 let tx = tx.clone();
                 let router = Arc::clone(&router);
                 let on_channel_connect = Arc::clone(&on_channel_connect);
                 let socket_status = Arc::clone(&socket_status);
+                let req_id = cmd.headers.req_id;
 
                 inflight.spawn(async move {
-                    if let Some(r) = handle_cmd(cmd, socket_status, permit, router, on_channel_connect).await
-                        && let Err(e) = tx.send(r).await {
-                            eprintln!("{}", e)
+                    match tokio::time::timeout(
+                        config.request_timeout,
+                        handle_cmd(cmd, socket_status, permit, router, on_channel_connect),
+                    )
+                    .await
+                    {
+                        Ok(r) => {
+                            if r.is_some() {
+                                if let Err(e) = tx.send(r.unwrap()).await {
+                                    eprintln!("{}", e);
+                                }
+                            }
                         }
+                        Err(_) => {
+                            if let Err(e) = tx.send(Response::timeout(req_id)).await {
+                                eprintln!("{}", e);
+                            }
+                        }
+                    };
                 });
             }
             Err(error) => {
@@ -302,9 +314,15 @@ async fn serve_connection<F>(
                     .send(Response::bad_request(
                         match error {
                             ProtocolError::Io(_) => 0,
-                            ProtocolError::MessageTooLarge { message: _, req_id } => req_id.unwrap_or_default(),
-                            ProtocolError::InvalidFrame { message: _, req_id } => req_id.unwrap_or_default(),
-                            ProtocolError::InvalidMessageType { message: _, req_id } => req_id.unwrap_or_default(),
+                            ProtocolError::MessageTooLarge { message: _, req_id } => {
+                                req_id.unwrap_or_default()
+                            }
+                            ProtocolError::InvalidFrame { message: _, req_id } => {
+                                req_id.unwrap_or_default()
+                            }
+                            ProtocolError::InvalidMessageType { message: _, req_id } => {
+                                req_id.unwrap_or_default()
+                            }
                             ProtocolError::InvalidUtf8 { req_id } => req_id.unwrap_or_default(),
                         },
                         Some(Bytes::from(error.to_string())),
@@ -327,90 +345,104 @@ async fn serve_connection<F>(
         writer.abort();
         let _ = writer.await;
     } else {
-        if let Err(_) = tokio::time::timeout(DRAIN_TIMEOUT, &mut writer).await {
+        if let Err(_) = tokio::time::timeout(config.drain_timeout, &mut writer).await {
             writer.abort();
             let _ = writer.await;
         }
-        let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let _ = tokio::time::timeout(config.drain_timeout, async {
             while let Some(Result::Ok(_)) = stream.next().await {}
         })
         .await;
     }
 }
 
-async fn handle_cmd<F>(cmd: Request, socket_status: Arc<AtomicU64>, permit: (OwnedSemaphorePermit, OwnedSemaphorePermit), router: Arc<Router>, on_channel_connect: Arc<F>
-) -> Option<Response> where F: Fn() -> SocketStatus + Send + Sync + 'static {
+async fn handle_cmd<F>(
+    cmd: Request,
+    socket_status: Arc<AtomicU64>,
+    permit: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    router: Arc<Router>,
+    on_channel_connect: Arc<F>,
+) -> Option<Response>
+where
+    F: Fn() -> SocketStatus + Send + Sync + 'static,
+{
     let req_id = cmd.headers.req_id;
 
     match SocketStatus::from_u64(socket_status.load(Ordering::Relaxed)) {
-        SocketStatus::Fresh => {
-            match cmd.headers.opcode {
-                RequestOpcode::Once => {
-                    socket_status.store(SocketStatus::to_u64(SocketStatus::Once), Ordering::Relaxed);
-                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+        SocketStatus::Fresh => match cmd.headers.opcode {
+            RequestOpcode::Once => {
+                socket_status.store(SocketStatus::to_u64(SocketStatus::Once), Ordering::Relaxed);
+                let response =
+                    match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
                         Result::Ok(r) => r,
                         Err(_) => Response::internal_error(req_id),
                     };
 
-                    drop(permit);
+                drop(permit);
 
-                    return Some(response);
-                    
-                },
-                RequestOpcode::ChannelConnect => {
-                    socket_status.store(SocketStatus::to_u64(on_channel_connect()), Ordering::Relaxed);
-                    drop(permit);
-                    return Some(Response::channel_connected(req_id));
-                },
-                RequestOpcode::ChannelMessage => {
-                    drop(permit);
-                    return Some(Response::bad_request(req_id, Some(Bytes::from("Channel not connected"))));
-                }
+                return Some(response);
+            }
+            RequestOpcode::ChannelConnect => {
+                socket_status.store(
+                    SocketStatus::to_u64(on_channel_connect()),
+                    Ordering::Relaxed,
+                );
+                drop(permit);
+                return Some(Response::channel_connected(req_id));
+            }
+            RequestOpcode::ChannelMessage => {
+                drop(permit);
+                return Some(Response::bad_request(
+                    req_id,
+                    Some(Bytes::from("Channel not connected")),
+                ));
             }
         },
-        SocketStatus::Once => {
-            match cmd.headers.opcode {
-                RequestOpcode::Once => {
-                    let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
+        SocketStatus::Once => match cmd.headers.opcode {
+            RequestOpcode::Once => {
+                let response =
+                    match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
                         Result::Ok(r) => r,
                         Err(_) => Response::internal_error(req_id),
                     };
 
-                    drop(permit);
+                drop(permit);
 
-                    return Some(response);
-                },
-                _ => {
-                    drop(permit);
-                    return Some(Response::connection_type_mismatch(req_id));
-                }
+                return Some(response);
+            }
+            _ => {
+                drop(permit);
+                return Some(Response::connection_type_mismatch(req_id));
             }
         },
-        SocketStatus::Channel(conn_id) => {
-            match cmd.headers.opcode {
-                RequestOpcode::ChannelConnect => {
-                    drop(permit);
-                    return Some(Response::conflict(req_id, Bytes::from("Channel already connected")));
-                },
-                RequestOpcode::ChannelMessage => {
-                    match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle_channel(cmd, &conn_id))) {
-                        Result::Ok(Result::Err(r)) => {
-                            drop(permit);
-                            return Some(r);
-                        },
-                        Err(_) => {
-                            drop(permit);
-                            return Some(Response::internal_error(req_id));
-                        },
-                        _ => {}
+        SocketStatus::Channel(conn_id) => match cmd.headers.opcode {
+            RequestOpcode::ChannelConnect => {
+                drop(permit);
+                return Some(Response::conflict(
+                    req_id,
+                    Bytes::from("Channel already connected"),
+                ));
+            }
+            RequestOpcode::ChannelMessage => {
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    router.handle_channel(cmd, &conn_id)
+                })) {
+                    Result::Ok(Result::Err(r)) => {
+                        drop(permit);
+                        return Some(r);
                     }
-                },
-                RequestOpcode::Once => {
-                    drop(permit);
-                    return Some(Response::connection_type_mismatch(req_id))
+                    Err(_) => {
+                        drop(permit);
+                        return Some(Response::internal_error(req_id));
+                    }
+                    _ => {}
                 }
             }
-        } 
+            RequestOpcode::Once => {
+                drop(permit);
+                return Some(Response::connection_type_mismatch(req_id));
+            }
+        },
     };
 
     None

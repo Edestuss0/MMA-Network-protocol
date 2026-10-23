@@ -5,6 +5,7 @@ use MMA::core::server::Server;
 use bytes::{Buf, Bytes};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -25,6 +26,9 @@ async fn main() {
         max_batch: 65535,
         max_in_flight: 65535,
         max_connections: 128_000,
+        drain_timeout: Duration::from_secs(2),
+        shutdown_grace: Duration::from_secs(10),
+        request_timeout: Duration::from_secs(10),
     };
 
     let mut router = Router::new();
@@ -55,12 +59,15 @@ async fn main() {
             "POW".to_string(),
             Arc::new(move |req, res| {
                 println!("{:?}", req);
-                let number = std::str::from_utf8(&req.payload).ok().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(2); 
+                let number = std::str::from_utf8(&req.payload)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .unwrap_or(2);
                 let pow = match req.get_option("pow".as_bytes()) {
                     Some(value) => str::from_utf8(&value).unwrap().parse::<u32>().unwrap(),
                     None => 2,
                 };
-                
+
                 let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
 
                 res.payload = Bytes::from(response);
@@ -70,18 +77,23 @@ async fn main() {
     {
         eprint!("Invalid route");
         panic!();
-        
     }
-   let handle = server.handle();
+    let handle = server.handle();
 
-    if router.register_channel_handler(String::from("SEND"), Arc::new(move |req, _| {
-        let payload = req.payload.clone();
+    if router
+        .register_channel_handler(
+            String::from("SEND"),
+            Arc::new(move |req, _| {
+                let payload = req.payload.clone();
 
-        let mut response = Response::new(0);
-        response.payload = payload;
+                let mut response = Response::new(0);
+                response.payload = payload;
 
-        let _ = handle.send_to_channel(0, response);
-    })).is_err() {
+                let _ = handle.send_to_channel(0, response);
+            }),
+        )
+        .is_err()
+    {
         eprint!("Invalid route");
         panic!();
     }

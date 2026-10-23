@@ -7,6 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Server timeout settings are expressed in milliseconds. */
+#define MMA_DRAIN_TIMEOUT_MS 2000ULL
+#define MMA_SHUTDOWN_GRACE_MS 10000ULL
+#define MMA_REQUEST_TIMEOUT_MS 10000ULL
+
 static volatile sig_atomic_t running = 1;
 
 static void handle_signal(int signal_number)
@@ -149,6 +154,11 @@ int main(void)
     config.max_batch = 65535;
     config.max_in_flight = 65535;
     config.max_connections = 128000;
+
+    /* Configure graceful connection draining, shutdown, and request handling. */
+    config.drain_timeout_ms = MMA_DRAIN_TIMEOUT_MS;
+    config.shutdown_grace_ms = MMA_SHUTDOWN_GRACE_MS;
+    config.request_timeout_ms = MMA_REQUEST_TIMEOUT_MS;
     config.framer.opcode_pos = 1;
     config.framer.version_pos = 4;
     config.framer.max_message_length = 10 * 1000 * 1000;

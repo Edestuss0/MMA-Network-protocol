@@ -22,7 +22,6 @@ fn response(payload: &[u8], options: Vec<(&str, &str)>) -> Response {
     value
 }
 
-
 fn round_trip(config: FramerConfig, item: Response) -> MMA::core::commands::Request {
     let expected_payload = item.payload.clone();
     let expected_options = item.options.clone();

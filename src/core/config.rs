@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use crate::core::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Port};
 
@@ -9,17 +12,24 @@ pub struct Config {
     pub max_batch: u32,
     pub max_in_flight: u32,
     pub max_connections: u32,
+    pub drain_timeout: Duration,
+    pub shutdown_grace: Duration,
+    pub request_timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("max_connections must be > 0")] MaxConnections,
-    #[error("max_in_flight must be > 0")] MaxInFlight,
-    #[error("max_batch must be > 0")] MaxBatch,
-    #[error("invalid framer config")] Framer,
-    #[error("invalid port")] Port
+    #[error("max_connections must be > 0")]
+    MaxConnections,
+    #[error("max_in_flight must be > 0")]
+    MaxInFlight,
+    #[error("max_batch must be > 0")]
+    MaxBatch,
+    #[error("invalid framer config")]
+    Framer,
+    #[error("invalid port")]
+    Port,
 }
-
 
 impl Config {
     pub fn default() -> Self {
@@ -29,6 +39,9 @@ impl Config {
             max_batch: 255,
             max_in_flight: 1024,
             max_connections: 128_000,
+            drain_timeout: Duration::from_secs(2),
+            shutdown_grace: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(10),
         }
     }
 

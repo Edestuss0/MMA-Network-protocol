@@ -18,7 +18,7 @@ enum ReservedRoutes {
 #[derive(Clone)]
 pub struct Router {
     routes: AHashMap<String, Handler>,
-    channel_handlers: AHashMap<String, ChannelHandler>
+    channel_handlers: AHashMap<String, ChannelHandler>,
 }
 
 impl Router {
@@ -36,7 +36,11 @@ impl Router {
         Result::Ok(())
     }
 
-    pub fn register_channel_handler(&mut self, route: String, handler: ChannelHandler) -> Result<(), ()> {
+    pub fn register_channel_handler(
+        &mut self,
+        route: String,
+        handler: ChannelHandler,
+    ) -> Result<(), ()> {
         if ReservedRoutes::from_str(route.to_uppercase().as_str()).is_ok() {
             return Err(());
         }

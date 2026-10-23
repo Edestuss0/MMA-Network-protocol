@@ -1,7 +1,7 @@
 use crate::core::{
     commands::ResponseOpcode::{
         BadRequest, ChannelConnected, ChannelMessage, Conflict, Forbidden, InternalError, NotFound,
-        Ok, Shutdown, Unauthorized,
+        Ok, Shutdown, Timeout, Unauthorized,
     },
     config::MMA_VERSION,
 };
@@ -19,7 +19,10 @@ pub struct Request {
 
 impl Request {
     pub fn get_option(&self, key: &[u8]) -> Option<Bytes> {
-        self.options.iter().find(|x| x.0 ==  key).map(|v| v.1.to_owned())
+        self.options
+            .iter()
+            .find(|x| x.0 == key)
+            .map(|v| v.1.to_owned())
     }
 }
 
@@ -59,13 +62,16 @@ pub enum ProtocolError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
     #[error("Invalid message type: {message}")]
-    InvalidMessageType{message: u8, req_id: Option<u32>},
+    InvalidMessageType { message: u8, req_id: Option<u32> },
     #[error("Invalid UTF-8 in key")]
-    InvalidUtf8{req_id: Option<u32>},
+    InvalidUtf8 { req_id: Option<u32> },
     #[error("Invalid frame: {message}")]
-    InvalidFrame{message: &'static str, req_id: Option<u32>},
+    InvalidFrame {
+        message: &'static str,
+        req_id: Option<u32>,
+    },
     #[error("Message too large: {message} bytes")]
-    MessageTooLarge{message: usize, req_id: Option<u32>},
+    MessageTooLarge { message: usize, req_id: Option<u32> },
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +101,7 @@ pub enum ResponseOpcode {
     ChannelMessage = 8,
     Shutdown = 9,
     ChannelConnected = 10,
+    Timeout = 11,
 }
 
 impl ResponseOpcode {
@@ -110,6 +117,7 @@ impl ResponseOpcode {
             8 => Some(ChannelMessage),
             9 => Some(Shutdown),
             10 => Some(ChannelConnected),
+            11 => Some(Timeout),
             _ => None,
         }
     }
@@ -125,10 +133,10 @@ pub struct Response {
 #[derive(Debug, Clone)]
 pub struct ChannelSendedMessage {
     pub message: Response,
-    pub conn_id: u32
+    pub conn_id: u32,
 }
 
-impl Response {    
+impl Response {
     pub fn new(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -193,7 +201,7 @@ impl Response {
     }
 
     pub fn channel_connected(req_id: u32) -> Self {
-         Self {
+        Self {
             headers: ResponseHeaders {
                 version: MMA_VERSION,
                 req_id,
@@ -212,6 +220,18 @@ impl Response {
                 opcode: ResponseOpcode::Conflict,
             },
             payload,
+            options: vec![],
+        }
+    }
+
+    pub fn timeout(req_id: u32) -> Self {
+        Self {
+            headers: ResponseHeaders {
+                version: MMA_VERSION,
+                req_id,
+                opcode: ResponseOpcode::Timeout,
+            },
+            payload: Bytes::from("Timeout error"),
             options: vec![],
         }
     }
