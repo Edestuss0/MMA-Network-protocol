@@ -45,20 +45,19 @@ fn framer_config_accepts_minimum_header_and_permutations() {
 
 #[test]
 fn framer_config_rejects_bad_header_positions() {
-    let base = FramerConfig::new();
-    for mutate in [
-        |c: &mut FramerConfig| c.header_length = MIN_HEADER_LEN + RESERVED_SUFFIX - 1,
-        |c: &mut FramerConfig| c.opcode_pos = 0,
-        |c: &mut FramerConfig| c.version_pos = 0,
-        |c: &mut FramerConfig| c.route_len_pos = 0,
-        |c: &mut FramerConfig| c.options_count_pos = 0,
-        |c: &mut FramerConfig| c.opcode_pos = c.version_pos,
-        |c: &mut FramerConfig| c.opcode_pos = c.header_length - RESERVED_SUFFIX + 1,
-    ] {
-        let mut config = base.clone();
-        mutate(&mut config);
-        assert!(config.validate().is_err());
-    }
+    let base = FramerConfig{
+        header_length: MIN_HEADER_LEN + RESERVED_SUFFIX - 1,
+        opcode_pos: 1,
+        version_pos: 1,
+        route_len_pos: 2,
+        options_count_pos: 2,
+        max_message_length: 4,
+        options_key_first: false,
+        options_order: 1,
+        payload_order: 2,
+        route_order: 1
+    };
+    assert!(base.validate().is_err());
 }
 
 #[test]

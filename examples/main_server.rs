@@ -19,7 +19,7 @@ async fn main() {
             route_order: 3,
             options_order: 2,
             payload_order: 1,
-            options_key_first: true,
+            options_key_first: false,
             header_length: 29,
         },
         max_batch: 65535,
@@ -54,12 +54,13 @@ async fn main() {
         .register_route(
             "POW".to_string(),
             Arc::new(move |req, res| {
+                println!("{:?}", req);
                 let number = std::str::from_utf8(&req.payload).ok().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(2); 
-                let pow: u32 = match req.get_option("pow".as_bytes()) {
-                    Some(value) => value.clone().get_u32(),
+                let pow = match req.get_option("pow".as_bytes()) {
+                    Some(value) => str::from_utf8(&value).unwrap().parse::<u32>().unwrap(),
                     None => 2,
                 };
-
+                
                 let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
 
                 res.payload = Bytes::from(response);
@@ -77,13 +78,13 @@ async fn main() {
         let payload = req.payload.clone();
 
         let mut response = Response::new(0);
-        response.payload = Bytes::from(payload);
+        response.payload = payload;
 
-        handle.send_to_channel(0, response);
+        let _ = handle.send_to_channel(0, response);
     })).is_err() {
         eprint!("Invalid route");
         panic!();
     }
 
-    server.run(router).await;
+    let _ = server.run(router).await;
 }

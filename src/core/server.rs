@@ -1,4 +1,5 @@
 use crate::core::commands::ChannelSendedMessage;
+use crate::core::commands::ProtocolError;
 use crate::core::commands::Request;
 use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
@@ -9,10 +10,8 @@ use crate::protocol::framer::Framer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::Receiver;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -161,14 +160,12 @@ impl Server {
             let permit = match conns_semaphore.try_acquire_owned() {
                 Result::Ok(p) => p,
                 Err(_) => {
-                    socket.shutdown().await;
+                    socket.shutdown().await?;
                     continue;
                 }
             };
 
             let _ = socket.set_nodelay(true);
-
-            // let conn_id: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
             let channel_receiver = self.channel_sender.subscribe();
 
             conns.spawn(serve_connection(
@@ -236,15 +233,14 @@ async fn serve_connection<F>(
                 _ => continue
             };
 
-            if message.conn_id == conn_id || message.conn_id == 0 {
-                if let Err(e) = tx_copy.send(message.message).await {
+            if (message.conn_id == conn_id || message.conn_id == 0)
+                && let Err(e) = tx_copy.send(message.message).await {
                     eprintln!("{}", e);
                 }
-            }
         }
     });
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let Err(e) = sink.feed(frame).await {
                 eprintln!("Error sending frame: {}", e);
@@ -281,7 +277,7 @@ async fn serve_connection<F>(
         
         match frame {
             Result::Ok(cmd) => {
-                let (permit_local, permit_global) = tokio::select! {
+                let permit = tokio::select! {
                     _ = stop.cancelled() => break,
                     per = Arc::clone(&conn_semaphore).acquire_owned() => {
                         let permit_local = Arc::clone(&semaphore).acquire_owned().await;
@@ -295,19 +291,22 @@ async fn serve_connection<F>(
                 let socket_status = Arc::clone(&socket_status);
 
                 inflight.spawn(async move {
-                    if let Some(r) = handle_cmd(cmd, socket_status, permit_global, router, on_channel_connect).await {
-                        if let Err(e) = tx.send(r).await {
+                    if let Some(r) = handle_cmd(cmd, socket_status, permit, router, on_channel_connect).await
+                        && let Err(e) = tx.send(r).await {
                             eprintln!("{}", e)
                         }
-                    }
-                    drop(permit_local);
-
                 });
             }
             Err(error) => {
                 if let Err(e) = tx
                     .send(Response::bad_request(
-                        0,
+                        match error {
+                            ProtocolError::Io(_) => 0,
+                            ProtocolError::MessageTooLarge { message: _, req_id } => req_id.unwrap_or_default(),
+                            ProtocolError::InvalidFrame { message: _, req_id } => req_id.unwrap_or_default(),
+                            ProtocolError::InvalidMessageType { message: _, req_id } => req_id.unwrap_or_default(),
+                            ProtocolError::InvalidUtf8 { req_id } => req_id.unwrap_or_default(),
+                        },
                         Some(Bytes::from(error.to_string())),
                     ))
                     .await
@@ -326,8 +325,12 @@ async fn serve_connection<F>(
     channel_sender.abort();
     if kill.is_cancelled() {
         writer.abort();
-    } else {
         let _ = writer.await;
+    } else {
+        if let Err(_) = tokio::time::timeout(DRAIN_TIMEOUT, &mut writer).await {
+            writer.abort();
+            let _ = writer.await;
+        }
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
             while let Some(Result::Ok(_)) = stream.next().await {}
         })
@@ -335,7 +338,7 @@ async fn serve_connection<F>(
     }
 }
 
-async fn handle_cmd<F>(cmd: Request, socket_status: Arc<AtomicU64>, permit: OwnedSemaphorePermit, router: Arc<Router>, on_channel_connect: Arc<F>
+async fn handle_cmd<F>(cmd: Request, socket_status: Arc<AtomicU64>, permit: (OwnedSemaphorePermit, OwnedSemaphorePermit), router: Arc<Router>, on_channel_connect: Arc<F>
 ) -> Option<Response> where F: Fn() -> SocketStatus + Send + Sync + 'static {
     let req_id = cmd.headers.req_id;
 
@@ -344,13 +347,6 @@ async fn handle_cmd<F>(cmd: Request, socket_status: Arc<AtomicU64>, permit: Owne
             match cmd.headers.opcode {
                 RequestOpcode::Once => {
                     socket_status.store(SocketStatus::to_u64(SocketStatus::Once), Ordering::Relaxed);
-
-                    // if lock_result.is_err() {
-                    //     drop(permit);
-
-                    //     return Some(Response::internal_error(req_id));
-                    // }
-
                     let response = match panic::catch_unwind(panic::AssertUnwindSafe(|| router.handle(cmd))) {
                         Result::Ok(r) => r,
                         Err(_) => Response::internal_error(req_id),
@@ -417,5 +413,5 @@ async fn handle_cmd<F>(cmd: Request, socket_status: Arc<AtomicU64>, permit: Owne
         } 
     };
 
-    return None;
+    None
 }

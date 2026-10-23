@@ -29,19 +29,19 @@ impl Router {
         }
     }
     pub fn register_route(&mut self, route: String, handler: Handler) -> Result<(), ()> {
-        if let Result::Ok(_) = ReservedRoutes::from_str(route.to_uppercase().as_str()) {
+        if ReservedRoutes::from_str(route.to_uppercase().as_str()).is_ok() {
             return Err(());
         }
         self.routes.insert(route, handler);
-        return Result::Ok(());
+        Result::Ok(())
     }
 
     pub fn register_channel_handler(&mut self, route: String, handler: ChannelHandler) -> Result<(), ()> {
-        if let Result::Ok(_) = ReservedRoutes::from_str(route.to_uppercase().as_str()) {
+        if ReservedRoutes::from_str(route.to_uppercase().as_str()).is_ok() {
             return Err(());
         }
         self.channel_handlers.insert(route, handler);
-        return Result::Ok(());
+        Result::Ok(())
     }
 
     fn validate_version(frame: &Request) -> Result<(), Response> {
@@ -83,9 +83,7 @@ impl Router {
     }
 
     pub fn handle_channel(&self, frame: Request, conn_id: &u32) -> Result<(), Response> {
-        if let Err(e) = Self::validate_version(&frame) {
-            return Err(e);
-        }
+        Self::validate_version(&frame)?;
         match self.channel_handlers.get(&frame.route) {
             Some(handler) => {
                 handler(frame, conn_id);

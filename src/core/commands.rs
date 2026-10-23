@@ -9,6 +9,7 @@ use bytes::Bytes;
 use std::io;
 use thiserror::Error;
 
+#[derive(Debug)]
 pub struct Request {
     pub headers: RequestHeaders,
     pub payload: Bytes,
@@ -18,10 +19,7 @@ pub struct Request {
 
 impl Request {
     pub fn get_option(&self, key: &[u8]) -> Option<Bytes> {
-        match self.options.iter().find(|x| x.0 ==  key) {
-            Some(v) => Some(v.1.to_owned()),
-            None => None
-        }
+        self.options.iter().find(|x| x.0 ==  key).map(|v| v.1.to_owned())
     }
 }
 
@@ -60,14 +58,14 @@ impl TryFrom<u8> for RequestOpcode {
 pub enum ProtocolError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-    #[error("Invalid message type: {0}")]
-    InvalidMessageType(u8),
+    #[error("Invalid message type: {message}")]
+    InvalidMessageType{message: u8, req_id: Option<u32>},
     #[error("Invalid UTF-8 in key")]
-    InvalidUtf8,
-    #[error("Invalid frame: {0}")]
-    InvalidFrame(&'static str),
-    #[error("Message too large: {0} bytes")]
-    MessageTooLarge(usize),
+    InvalidUtf8{req_id: Option<u32>},
+    #[error("Invalid frame: {message}")]
+    InvalidFrame{message: &'static str, req_id: Option<u32>},
+    #[error("Message too large: {message} bytes")]
+    MessageTooLarge{message: usize, req_id: Option<u32>},
 }
 
 #[derive(Debug, Clone)]
@@ -213,7 +211,7 @@ impl Response {
                 req_id,
                 opcode: ResponseOpcode::Conflict,
             },
-            payload: payload,
+            payload,
             options: vec![],
         }
     }
