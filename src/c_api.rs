@@ -9,7 +9,6 @@ use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -80,13 +79,13 @@ pub struct MMA_Response {
 }
 
 pub type MMA_RouteCallback =
-    Option<extern "C" fn(*const MMA_Request, *mut MMA_Response, *mut c_void) -> i32>;
+    Option<extern "C" fn(MMA_Request, MMA_Response, *const c_void) -> MMA_Response>;
 pub type MMA_ChannelHandlerCallback =
     Option<extern "C" fn(*const MMA_Request, u32, *mut c_void) -> i32>;
 
 struct RegisteredRoute {
     route: String,
-    callback: extern "C" fn(*const MMA_Request, *mut MMA_Response, *mut c_void) -> i32,
+    callback: extern "C" fn(MMA_Request, MMA_Response, *const c_void) -> MMA_Response,
     user_data: usize,
 }
 
@@ -182,10 +181,72 @@ fn router_from_registrations(
         let callback = route.callback;
         let route_name = route.route.clone();
         let user_data = route.user_data;
+        let route_name_clone = route_name.clone();
         if router
             .register_route(
                 route.route.clone(),
-                Arc::new(move |request: Request, response: &mut Response| {
+                move |request: Request, response: Response| {
+                    let route_name = route_name_clone.clone();
+                    let request_id = request.headers.req_id;
+                    let response_ptr = Box::into_raw(Box::new(response)) as usize;
+                    Box::pin(async move {
+                        let options: Vec<MMA_Option> = request
+                            .options
+                            .iter()
+                            .map(|(key, value)| MMA_Option {
+                                key: key.as_ptr(),
+                                key_len: key.len(),
+                                value: value.as_ptr(),
+                                value_len: value.len(),
+                            })
+                            .collect();
+                        let request_view = MMA_Request {
+                            route: route_name.as_ptr(),
+                            route_len: route_name.len(),
+                            opcode: request.headers.opcode as u8,
+                            version: request.headers.version,
+                            request_id: request.headers.req_id,
+                            payload: request.payload.as_ptr(),
+                            payload_len: request.payload.len(),
+                            options: if options.is_empty() {
+                                ptr::null()
+                            } else {
+                                options.as_ptr()
+                            },
+                            options_count: options.len(),
+                        };
+                        let response_view = MMA_Response {
+                            response: response_ptr as *mut Response,
+                        };
+                        let returned =
+                            callback(request_view, response_view, user_data as *const c_void);
+                        let returned_ptr = returned.response;
+                        let final_response = if returned_ptr.is_null() {
+                            unsafe {
+                                drop(Box::from_raw(response_ptr as *mut Response));
+                            }
+                            Response::internal_error(request_id)
+                        } else {
+                            unsafe { *Box::from_raw(returned_ptr) }
+                        };
+                        final_response
+                    })
+                },
+            )
+            .is_err()
+        {
+            continue;
+        }
+    }
+    for handler in channel_handlers {
+        let callback = handler.callback;
+        let route_name = handler.route.clone();
+        let user_data = handler.user_data;
+        let _ = router.register_channel_handler(
+            handler.route.clone(),
+            move |request: Request, conn_id: u32| {
+                let route_name = route_name.clone();
+                async move {
                     let options: Vec<MMA_Option> = request
                         .options
                         .iter()
@@ -211,71 +272,30 @@ fn router_from_registrations(
                         },
                         options_count: options.len(),
                     };
-                    let mut response_view = MMA_Response {
-                        response: response as *mut Response,
-                    };
-                    let status =
-                        callback(&request_view, &mut response_view, user_data as *mut c_void);
+                    let status = callback(&request_view, conn_id, user_data as *mut c_void);
                     if status != MMA_OK {
-                        eprintln!("MMA route {route_name} callback returned status {status}");
-                        response.headers.opcode = ResponseOpcode::InternalError;
-                        response.payload = bytes::Bytes::new();
-                        response.options.clear();
+                        eprintln!(
+                            "MMA channel handler {route_name} callback returned status {status}"
+                        );
                     }
-                }),
-            )
-            .is_err()
-        {
-            continue;
-        }
-    }
-    for handler in channel_handlers {
-        let callback = handler.callback;
-        let route_name = handler.route.clone();
-        let user_data = handler.user_data;
-        let _ = router.register_channel_handler(
-            handler.route.clone(),
-            Arc::new(move |request: Request, conn_id: &u32| {
-                let options: Vec<MMA_Option> = request
-                    .options
-                    .iter()
-                    .map(|(key, value)| MMA_Option {
-                        key: key.as_ptr(),
-                        key_len: key.len(),
-                        value: value.as_ptr(),
-                        value_len: value.len(),
-                    })
-                    .collect();
-                let request_view = MMA_Request {
-                    route: route_name.as_ptr(),
-                    route_len: route_name.len(),
-                    opcode: request.headers.opcode as u8,
-                    version: request.headers.version,
-                    request_id: request.headers.req_id,
-                    payload: request.payload.as_ptr(),
-                    payload_len: request.payload.len(),
-                    options: if options.is_empty() {
-                        ptr::null()
-                    } else {
-                        options.as_ptr()
-                    },
-                    options_count: options.len(),
-                };
-                let status = callback(&request_view, *conn_id, user_data as *mut c_void);
-                if status != MMA_OK {
-                    eprintln!("MMA channel handler {route_name} callback returned status {status}");
                 }
-            }),
+            },
         );
     }
     router
 }
 
-unsafe fn response_mut<'a>(response: *mut MMA_Response) -> Result<&'a mut Response, i32> {
-    if response.is_null() || unsafe { (*response).response.is_null() } {
+unsafe fn response_mut<'a>(response: MMA_Response) -> Result<&'a mut Response, i32> {
+    if response.response.is_null() {
         return Err(MMA_INVALID_ARGUMENT);
     }
-    Ok(unsafe { &mut *(*response).response })
+    Ok(unsafe { &mut *response.response })
+}
+
+fn response_error() -> MMA_Response {
+    MMA_Response {
+        response: ptr::null_mut(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -518,43 +538,52 @@ pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_response_set_status(response: *mut MMA_Response, opcode: u8) -> i32 {
+pub unsafe extern "C" fn mma_response_set_status(
+    response: MMA_Response,
+    opcode: u8,
+) -> MMA_Response {
     let Some(opcode) = ResponseOpcode::from_number(opcode) else {
-        return MMA_INVALID_ARGUMENT;
+        return response_error();
     };
+    let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,
-        Err(status) => return status,
+        Err(_) => return response_error(),
     };
     response.headers.opcode = opcode;
-    MMA_OK
+    MMA_Response {
+        response: response_ptr,
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_set_payload(
-    response: *mut MMA_Response,
+    response: MMA_Response,
     data: *const u8,
     data_len: usize,
-) -> i32 {
+) -> MMA_Response {
     if !valid_slice(data, data_len) {
-        return MMA_INVALID_ARGUMENT;
+        return response_error();
     }
+    let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,
-        Err(status) => return status,
+        Err(_) => return response_error(),
     };
     response.payload = bytes::Bytes::copy_from_slice(unsafe { raw_slice(data, data_len) });
-    MMA_OK
+    MMA_Response {
+        response: response_ptr,
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_add_option(
-    response: *mut MMA_Response,
+    response: MMA_Response,
     key: *const u8,
     key_len: usize,
     value: *const u8,
     value_len: usize,
-) -> i32 {
+) -> MMA_Response {
     if !valid_slice(key, key_len)
         || !valid_slice(value, value_len)
         || key_len == 0
@@ -562,27 +591,30 @@ pub unsafe extern "C" fn mma_response_add_option(
         || key_len > u16::MAX as usize
         || value_len > u16::MAX as usize
     {
-        return MMA_INVALID_ARGUMENT;
+        return response_error();
     }
     let key = match std::str::from_utf8(unsafe { raw_slice(key, key_len) }) {
         Ok(value) => value,
-        Err(_) => return MMA_INVALID_ARGUMENT,
+        Err(_) => return response_error(),
     };
     let value = match std::str::from_utf8(unsafe { raw_slice(value, value_len) }) {
         Ok(value) => value,
-        Err(_) => return MMA_INVALID_ARGUMENT,
+        Err(_) => return response_error(),
     };
+    let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,
-        Err(status) => return status,
+        Err(_) => return response_error(),
     };
     if response.options.len() >= u8::MAX as usize {
-        return MMA_INVALID_ARGUMENT;
+        return response_error();
     }
     response
         .options
         .push((Bytes::from(key), Bytes::from(value)));
-    MMA_OK
+    MMA_Response {
+        response: response_ptr,
+    }
 }
 
 #[cfg(test)]

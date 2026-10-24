@@ -28,7 +28,9 @@ enum {
 };
 
 typedef struct MMA_Server MMA_Server;
-typedef struct MMA_Response MMA_Response;
+typedef struct MMA_Response {
+    const void *inner;
+} MMA_Response;
 
 typedef struct {
     uint32_t max_message_length;
@@ -75,23 +77,23 @@ typedef struct {
     size_t options_count;
 } MMA_Request;
 
-typedef int32_t (*MMA_RouteCallback)(
-    const MMA_Request *request,
-    MMA_Response *response,
-    void *user_data
+typedef MMA_Response (*MMA_RouteCallback)(
+    MMA_Request request,
+    MMA_Response response,
+    const void *user_data
 );
 
 typedef int32_t (*MMA_ChannelHandlerCallback)(
     const MMA_Request *request,
     uint32_t connection_id,
-    void *user_data
+    const void *user_data
 );
 
 /*
  * Request and option data are borrowed and valid only during the callback.
- * Response data must be set with the response functions so it is copied safely.
- * A callback must return MMA_OK; any other return value produces an internal
- * error response. Callbacks may execute concurrently on runtime worker threads,
+ * Route callbacks receive a response value and return the response value after
+ * applying zero or more transformations with mma_response_* functions.
+ * Callbacks may execute concurrently on runtime worker threads,
  * so synchronize shared user_data and keep it alive until the server stops.
  * Register routes before starting the server; callbacks should not block.
  */
@@ -103,14 +105,14 @@ int32_t mma_server_register_route(
     const uint8_t *route,
     size_t route_len,
     MMA_RouteCallback callback,
-    void *user_data
+    const void *user_data
 );
 int32_t mma_server_register_channel_handler(
     MMA_Server *server,
     const uint8_t *route,
     size_t route_len,
     MMA_ChannelHandlerCallback callback,
-    void *user_data
+    const void *user_data
 );
 /* Backward-compatible alias for mma_server_register_route. */
 int32_t mma_server_route(
@@ -118,20 +120,20 @@ int32_t mma_server_route(
     const uint8_t *route,
     size_t route_len,
     MMA_RouteCallback callback,
-    void *user_data
+    const void *user_data
 );
 int32_t mma_server_start(MMA_Server *server);
 int32_t mma_server_stop(MMA_Server *server);
 void mma_server_destroy(MMA_Server *server);
 
-int32_t mma_response_set_status(MMA_Response *response, uint8_t opcode);
-int32_t mma_response_set_payload(
-    MMA_Response *response,
+MMA_Response mma_response_set_status(MMA_Response response, uint8_t opcode);
+MMA_Response mma_response_set_payload(
+    MMA_Response response,
     const uint8_t *data,
     size_t data_len
 );
-int32_t mma_response_add_option(
-    MMA_Response *response,
+MMA_Response mma_response_add_option(
+    MMA_Response response,
     const uint8_t *key,
     size_t key_len,
     const uint8_t *value,

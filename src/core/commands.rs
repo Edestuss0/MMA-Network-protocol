@@ -144,7 +144,7 @@ impl Response {
                 req_id,
                 opcode: ResponseOpcode::Ok,
             },
-            payload: Bytes::from("Empty response"),
+            payload: Bytes::new(),
             options: vec![],
         }
     }

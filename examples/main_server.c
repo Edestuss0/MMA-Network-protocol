@@ -20,22 +20,19 @@ static void handle_signal(int signal_number)
     running = 0;
 }
 
-static int32_t get_route(
-    const MMA_Request *request,
-    MMA_Response *response,
-    void *user_data
+static MMA_Response get_route(
+    MMA_Request request,
+    MMA_Response response,
+    const void *user_data
 )
 {
     (void)user_data;
 
-    int32_t status = mma_response_set_status(response, MMA_RESPONSE_OK);
-    if (status != MMA_OK) {
-        return status;
-    }
+    response = mma_response_set_status(response, MMA_RESPONSE_OK);
     return mma_response_set_payload(
         response,
-        request->payload,
-        request->payload_len
+        request.payload,
+        request.payload_len
     );
 }
 
@@ -57,19 +54,19 @@ static uint32_t wrapping_pow(int32_t base, uint32_t exponent)
     return result;
 }
 
-static int32_t pow_route(
-    const MMA_Request *request,
-    MMA_Response *response,
-    void *user_data
+static MMA_Response pow_route(
+    MMA_Request request,
+    MMA_Response response,
+    const void *user_data
 )
 {
     (void)user_data;
 
     int32_t number = 1;
-    if (request->payload_len > 0 && request->payload_len < 64) {
+    if (request.payload_len > 0 && request.payload_len < 64) {
         char buffer[64];
-        memcpy(buffer, request->payload, request->payload_len);
-        buffer[request->payload_len] = '\0';
+        memcpy(buffer, request.payload, request.payload_len);
+        buffer[request.payload_len] = '\0';
         char *end = NULL;
         long parsed = strtol(buffer, &end, 10);
         if (end != buffer && *end == '\0' && parsed >= INT32_MIN && parsed <= INT32_MAX) {
@@ -78,8 +75,8 @@ static int32_t pow_route(
     }
 
     uint32_t exponent = 2;
-    for (size_t i = 0; i < request->options_count; ++i) {
-        const MMA_Option *option = &request->options[i];
+    for (size_t i = 0; i < request.options_count; ++i) {
+        const MMA_Option *option = &request.options[i];
         if (
             option->key_len == 3 &&
             memcmp(option->key, "pow", 3) == 0 &&
@@ -113,13 +110,10 @@ static int32_t pow_route(
         wrapping_pow(number, exponent)
     );
     if (payload_len < 0 || (size_t)payload_len >= sizeof(payload)) {
-        return MMA_SERVER_ERROR;
+        return response;
     }
 
-    int32_t status = mma_response_set_status(response, MMA_RESPONSE_OK);
-    if (status != MMA_OK) {
-        return status;
-    }
+    response = mma_response_set_status(response, MMA_RESPONSE_OK);
     return mma_response_set_payload(
         response,
         (const uint8_t *)payload,
@@ -130,7 +124,7 @@ static int32_t pow_route(
 static int32_t send_channel(
     const MMA_Request *request,
     uint32_t connection_id,
-    void *user_data
+    const void *user_data
 )
 {
     (void)request;

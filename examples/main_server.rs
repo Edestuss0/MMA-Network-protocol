@@ -1,7 +1,7 @@
-use MMA::core::commands::Response;
+use MMA::core::commands::{Request, Response};
 use MMA::core::config::{Config, FramerConfig};
-use MMA::core::router::Router;
-use MMA::core::server::Server;
+use MMA::core::router::{self, Router};
+use MMA::core::server::{Server, ServerHandle};
 use bytes::{Buf, Bytes};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -41,62 +41,57 @@ async fn main() {
         }
     };
 
-    if router
-        .register_route(
-            "GET".to_string(),
-            Arc::new(move |request, res| {
-                res.payload = request.payload;
-            }),
-        )
-        .is_err()
-    {
-        eprint!("Invalid route");
-        panic!();
-    }
-
-    if router
-        .register_route(
-            "POW".to_string(),
-            Arc::new(move |req, res| {
-                println!("{:?}", req);
-                let number = std::str::from_utf8(&req.payload)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i32>().ok())
-                    .unwrap_or(2);
-                let pow = match req.get_option("pow".as_bytes()) {
-                    Some(value) => str::from_utf8(&value).unwrap().parse::<u32>().unwrap(),
-                    None => 2,
-                };
-
-                let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
-
-                res.payload = Bytes::from(response);
-            }),
-        )
-        .is_err()
-    {
+    if router.register_route(String::from("POW"), pow).is_err() {
         eprint!("Invalid route");
         panic!();
     }
     let handle = server.handle();
 
-    if router
-        .register_channel_handler(
-            String::from("SEND"),
-            Arc::new(move |req, _| {
-                let payload = req.payload.clone();
+    if router  .register_channel_handler(
+        String::from("SEND"),
+        {
+            let handle = handle.clone();
 
-                let mut response = Response::new(0);
-                response.payload = payload;
+            move |req, conn_id| {
+                let handle = handle.clone();
 
-                let _ = handle.send_to_channel(0, response);
-            }),
-        )
-        .is_err()
-    {
-        eprint!("Invalid route");
-        panic!();
-    }
+                async move {
+                    send(req, conn_id, handle).await;
+                }
+            }
+        },
+    )
+    .is_err()
+{
+    eprintln!("Invalid route");
+    panic!();
+}
 
     let _ = server.run(router).await;
+}
+
+async fn pow(req: Request, mut res: Response) -> Response {
+    let number = std::str::from_utf8(&req.payload)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(2);
+    let pow = match req.get_option("pow".as_bytes()) {
+        Some(value) => str::from_utf8(&value).unwrap().parse::<u32>().unwrap(),
+        None => 2,
+    };
+
+    let response = format!("{}^{} = {}", number, pow, (number.pow(pow)));
+
+    res.payload = Bytes::from(response);
+
+    res
+}
+
+async fn send(req: Request, conn_id: u32, handle: ServerHandle) {
+    let payload = req.payload.clone();
+
+    let mut response = Response::new(0);
+    response.payload = payload;
+
+    let _ = handle.send_to_channel(0, response);
 }
