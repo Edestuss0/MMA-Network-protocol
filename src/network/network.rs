@@ -10,9 +10,11 @@ use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use tokio::task::JoinHandle;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -60,10 +62,10 @@ pub async fn serve_connection<F>(
     stop: CancellationToken,
     kill: CancellationToken,
     conn_permit: OwnedSemaphorePermit,
-    mut channel_receiver: broadcast::Receiver<ChannelSendedMessage>,
+    
     on_channel_connect: F,
 ) where
-    F: Fn() -> SocketStatus + Send + Sync + 'static,
+    F: Fn() -> (SocketStatus, broadcast::Receiver<ChannelSendedMessage>) + Send + Sync + 'static,
 {
     let mut config = config_receiver.borrow_and_update().clone();
 
@@ -80,23 +82,7 @@ pub async fn serve_connection<F>(
 
     let on_channel_connect = Arc::new(on_channel_connect);
     let socket_status = Arc::new(AtomicU64::new(SocketStatus::to_u64(SocketStatus::Fresh)));
-    let channel_socket_status = Arc::clone(&socket_status);
-
-    let channel_sender = tokio::spawn(async move {
-        while let Ok(message) = channel_receiver.recv().await {
-            let conn_id =
-                match SocketStatus::from_u64(channel_socket_status.load(Ordering::Relaxed)) {
-                    SocketStatus::Channel(x) => x,
-                    _ => continue,
-                };
-
-            if (message.conn_id == conn_id || message.conn_id == 0)
-                && let Err(e) = tx_copy.send(message.message).await
-            {
-                eprintln!("{}", e);
-            }
-        }
-    });
+    let channel_task: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     let mut writer = writer(sink, rx, config.max_batch);
 
@@ -146,6 +132,9 @@ pub async fn serve_connection<F>(
 
                 let request_timeout = config.request_timeout;
 
+                let channel_task_for_cmd = Arc::clone(&channel_task);
+                let tx_for_channel = tx_copy.clone();
+
                 inflight.spawn(async move {
                     match tokio::time::timeout(
                         request_timeout,
@@ -154,7 +143,54 @@ pub async fn serve_connection<F>(
                             socket_status,
                             permit_global,
                             router,
-                            on_channel_connect,
+                            Arc::new(move || -> SocketStatus {
+                                let (status, mut receiver) = on_channel_connect();
+
+                                let conn_id = match status {
+                                    SocketStatus::Channel(id) => id,
+                                    _ => return status,
+                                };
+
+                                let tx_channel = tx_for_channel.clone();
+
+                                let relay_task = tokio::spawn(async move {
+                                    loop {
+                                        match receiver.recv().await {
+                                            Ok(message) => {
+                                                if message.conn_id == conn_id || message.conn_id == 0 {
+                                                    if tx_channel.send(message.message).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                                eprintln!(
+                                                    "Channel receiver lagged; skipped {skipped} messages"
+                                                );
+                                            }
+
+                                            Err(broadcast::error::RecvError::Closed) => {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                match channel_task_for_cmd.lock() {
+                                    Ok(mut slot) => {
+                                        if let Some(previous) = slot.replace(relay_task) {
+                                            previous.abort();
+                                        }
+                                    }
+
+                                    Err(_) => {
+                                        relay_task.abort();
+                                    }
+                                }
+
+                                status
+                            })
                         ),
                     )
                     .await
@@ -204,7 +240,11 @@ pub async fn serve_connection<F>(
     tokio::select! { _ = inflight.wait() => {}, _ = kill.cancelled() => {} }
     drop(tx);
     drop(conn_permit);
-    channel_sender.abort();
+    if let Ok(mut slot) = channel_task.lock() {
+        if let Some(task) = slot.take() {
+            task.abort();
+        }
+    }
     if kill.is_cancelled() {
         writer.abort();
         let _ = writer.await;

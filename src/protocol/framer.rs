@@ -215,7 +215,7 @@ fn encode_options(
     let mut validate_set = AHashSet::<&[u8]>::with_capacity(options.len());
 
     for (key, value) in options {
-        if key.is_empty() {
+        if key.is_empty() || value.is_empty() {
             return Err(ProtocolError::InvalidFrame {
                 message: "Option can't be empty",
                 req_id,

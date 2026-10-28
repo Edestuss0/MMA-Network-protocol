@@ -26,10 +26,14 @@ enum {
     MMA_RESPONSE_NOT_FOUND = 5,
     MMA_RESPONSE_CONFLICT = 6,
     MMA_RESPONSE_INTERNAL_ERROR = 7,
-    MMA_RESPONSE_MESSAGE = 8
+    MMA_RESPONSE_MESSAGE = 8,
+    MMA_RESPONSE_SHUTDOWN = 9,
+    MMA_RESPONSE_CHANNEL_CONNECTED = 10,
+    MMA_RESPONSE_TIMEOUT = 11
 };
 
 typedef struct MMA_Server MMA_Server;
+typedef struct MMA_ServerHandle MMA_ServerHandle;
 typedef struct MMA_Response {
     const void *inner;
 } MMA_Response;
@@ -148,6 +152,29 @@ MMA_Response mma_response_add_option(
     const uint8_t *value,
     size_t value_len
 );
+
+int32_t mma_server_get_handle(
+    const MMA_Server *server,
+    MMA_ServerHandle **output
+);
+
+void mma_server_handle_destroy(
+    MMA_ServerHandle *handle
+);
+
+int32_t mma_server_handle_send_to_channel(
+    const MMA_ServerHandle *handle,
+    uint32_t conn_id,
+    MMA_Response message
+);
+
+int32_t mma_server_handle_change_config(
+    const MMA_ServerHandle *handle,
+    const MMA_ServerConfig *config
+);
+
+MMA_Response mma_response_new(uint32_t request_id);
+void mma_response_destroy(MMA_Response response);
 
 #ifdef __cplusplus
 }

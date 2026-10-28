@@ -3,12 +3,13 @@
 use crate::core::commands::{Request, Response, ResponseOpcode};
 use crate::core::config::{BigBytesConfig, Config, FramerConfig};
 use crate::core::router::Router;
-use crate::core::server::Server;
+use crate::core::server::{Server, ServerHandle};
 use bytes::Bytes;
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -37,8 +38,8 @@ pub struct MMA_FramerConfig {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MMA_BigBytesConfig {
-    pub payload_len_order: u8,
     pub options_len_order: u8,
+    pub payload_len_order: u8,
     pub req_id_order: u8
 }
 
@@ -80,6 +81,9 @@ pub struct MMA_Request {
     pub options: *const MMA_Option,
     pub options_count: usize,
 }
+pub struct MMA_ServerHandle {
+    inner: ServerHandle,
+}
 
 #[repr(C)]
 pub struct MMA_Response {
@@ -111,6 +115,7 @@ pub struct MMA_Server {
     started: bool,
     stop: CancellationToken,
     thread: Option<JoinHandle<()>>,
+    handle: Option<ServerHandle>,
 }
 
 fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
@@ -149,20 +154,27 @@ fn framer_config_to_c(config: &FramerConfig) -> MMA_FramerConfig {
 }
 
 fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
-    let ip_str = unsafe { CStr::from_ptr(config.bind_ip) }.to_str().ok()?;
-    let ip_addr = Ipv4Addr::from_str(ip_str).ok()?;
+    if config.bind_ip.is_null() {
+        return None;
+    }
+
+    let ip_str = unsafe {
+        CStr::from_ptr(config.bind_ip)
+    }
+    .to_str()
+    .ok()?;
+
+    let ip_addr = IpAddr::from_str(ip_str).ok()?;
 
     Some(Config {
-        address: SocketAddr::new(IpAddr::V4(ip_addr), config.port),
-        frame_config: match framer_config_from_c(config.framer) {
-            Some(c) => c,
-            None => {
-                return None;
-            }
-        },
+        address: SocketAddr::new(ip_addr, config.port),
+
+        frame_config: framer_config_from_c(config.framer)?,
+
         max_batch: config.max_batch,
         max_connections: config.max_connections,
         max_in_flight: config.max_in_flight,
+
         drain_timeout: Duration::from_millis(config.drain_timeout_ms),
         shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
         request_timeout: Duration::from_millis(config.request_timeout_ms),
@@ -375,6 +387,7 @@ pub unsafe extern "C" fn mma_server_create(
         started: false,
         stop: CancellationToken::new(),
         thread: None,
+        handle: None
     };
     unsafe {
         *output = Box::into_raw(Box::new(server));
@@ -461,18 +474,30 @@ pub unsafe extern "C" fn mma_server_route(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
+pub unsafe extern "C" fn mma_server_start(
+    server: *mut MMA_Server,
+) -> i32 {
     if server.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
+
     let server = unsafe { &mut *server };
+
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
     }
+
     let config = server.config.clone();
-    let router = router_from_registrations(&server.routes, &server.channel_handlers);
+    let router = router_from_registrations(
+        &server.routes,
+        &server.channel_handlers,
+    );
 
     let stop = server.stop.clone();
+
+    let (ready_tx, ready_rx) =
+        mpsc::sync_channel::<Result<(SocketAddr, ServerHandle), String>>(1);
+
     let thread = match thread::Builder::new()
         .name("mma-server".to_owned())
         .spawn(move || {
@@ -481,36 +506,201 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
                 .build()
             {
                 Ok(runtime) => runtime,
-                Err(_) => {
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "Tokio runtime initialization failed: {error}"
+                    )));
                     return;
                 }
             };
+
             runtime.block_on(async move {
-                let listener = match tokio::net::TcpListener::bind(config.address).await {
-                    Ok(listener) => listener,
+                let listener =
+                    match tokio::net::TcpListener::bind(config.address).await {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "TCP bind failed: {error}"
+                            )));
+                            return;
+                        }
+                    };
+
+                let local_addr = match listener.local_addr() {
+                    Ok(addr) => addr,
                     Err(error) => {
-                        eprintln!("MMA server bind failed: {error}");
+                        let _ = ready_tx.send(Err(format!(
+                            "Cannot obtain listener address: {error}"
+                        )));
                         return;
                     }
                 };
-                let mut server = match Server::from_listener(config, listener) {
+
+                let mut running_server = match Server::from_listener(
+                    config,
+                    listener,
+                ) {
                     Ok(server) => server,
                     Err(error) => {
-                        eprintln!("MMA server initialization failed: {error}");
+                        let _ = ready_tx.send(Err(format!(
+                            "Server initialization failed: {error}"
+                        )));
                         return;
                     }
                 };
-                if let Err(error) = server.run_until(router, stop.cancelled()).await {
+
+                let handle = running_server.handle();
+
+                if ready_tx.send(Ok((local_addr, handle))).is_err() {
+                    return;
+                }
+
+                if let Err(error) = running_server
+                    .run_until(router, stop.cancelled())
+                    .await
+                {
                     eprintln!("MMA server stopped after an error: {error}");
                 }
             });
-        }) {
+        })
+    {
         Ok(thread) => thread,
-        Err(_) => return MMA_SERVER_ERROR,
+        Err(error) => {
+            eprintln!("Failed to create MMA server thread: {error}");
+            return MMA_SERVER_ERROR;
+        }
     };
-    server.thread = Some(thread);
-    server.started = true;
+
+    match ready_rx.recv() {
+        Ok(Ok((local_addr, handle))) => {
+            server.bound_port = local_addr.port();
+            server.handle = Some(handle);
+            server.thread = Some(thread);
+            server.started = true;
+
+            MMA_OK
+        }
+
+        Ok(Err(error)) => {
+            eprintln!("MMA server startup failed: {error}");
+            let _ = thread.join();
+            MMA_SERVER_ERROR
+        }
+
+        Err(error) => {
+            eprintln!("MMA server startup handshake failed: {error}");
+            let _ = thread.join();
+            MMA_SERVER_ERROR
+        }
+    }
+}
+
+/// Создаёт независимый C handle из запущенного сервера.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_get_handle(
+    server: *const MMA_Server,
+    output: *mut *mut MMA_ServerHandle,
+) -> i32 {
+    if server.is_null() || output.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+
+    unsafe {
+        *output = ptr::null_mut();
+    }
+
+    let server = unsafe { &*server };
+
+    if !server.started {
+        return MMA_SERVER_ERROR;
+    }
+
+    let Some(thread) = server.thread.as_ref() else {
+        return MMA_SERVER_ERROR;
+    };
+
+    if thread.is_finished() {
+        return MMA_SERVER_ERROR;
+    }
+
+    let Some(handle) = server.handle.as_ref() else {
+        return MMA_SERVER_ERROR;
+    };
+
+    let handle = Box::new(MMA_ServerHandle {
+        inner: handle.clone(),
+    });
+
+    unsafe {
+        *output = Box::into_raw(handle);
+    }
+
     MMA_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_handle_destroy(
+    handle: *mut MMA_ServerHandle,
+) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_handle_send_to_channel(
+    handle: *const MMA_ServerHandle,
+    conn_id: u32,
+    message: MMA_Response,
+) -> i32 {
+    if handle.is_null() || message.response.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+
+    let handle = unsafe { &*handle };
+    let message = unsafe { (&*message.response).clone() };
+
+    match handle.inner.send_to_channel(conn_id, message) {
+        Ok(()) => MMA_OK,
+        Err(()) => MMA_SERVER_ERROR,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_handle_change_config(
+    handle: *const MMA_ServerHandle,
+    config: *const MMA_ServerConfig,
+) -> i32 {
+    if handle.is_null() || config.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+
+    let handle = unsafe { &*handle };
+    let config = unsafe { &*config };
+
+    if config.bind_ip.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+
+    let Some(config) = config_from_c(config) else {
+        return MMA_INVALID_CONFIG;
+    };
+
+    if config.frame_config.validate().is_err()
+        || config.validate().is_err()
+    {
+        return MMA_INVALID_CONFIG;
+    }
+
+    match handle.inner.change_config(config) {
+        Ok(()) => MMA_OK,
+        Err(error) => {
+            eprintln!("MMA config update failed: {error}");
+            MMA_SERVER_ERROR
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -544,6 +734,24 @@ pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
     if !server.is_null() {
         let _ = unsafe { mma_server_stop(server) };
         drop(unsafe { Box::from_raw(server) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mma_response_new(request_id: u32) -> MMA_Response {
+    MMA_Response {
+        response: Box::into_raw(Box::new(Response::new(request_id))),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_response_destroy(
+    response: MMA_Response,
+) {
+    if !response.response.is_null() {
+        unsafe {
+            drop(Box::from_raw(response.response));
+        }
     }
 }
 
@@ -603,14 +811,8 @@ pub unsafe extern "C" fn mma_response_add_option(
     {
         return response_error();
     }
-    let key = match std::str::from_utf8(unsafe { raw_slice(key, key_len) }) {
-        Ok(value) => value,
-        Err(_) => return response_error(),
-    };
-    let value = match std::str::from_utf8(unsafe { raw_slice(value, value_len) }) {
-        Ok(value) => value,
-        Err(_) => return response_error(),
-    };
+    let key = unsafe { raw_slice(key, key_len)};
+    let value = unsafe { raw_slice(value, value_len) };
     let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,

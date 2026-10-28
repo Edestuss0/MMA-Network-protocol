@@ -150,7 +150,8 @@ impl Server {
             };
 
             let _ = socket.set_nodelay(true);
-            let channel_receiver = self.channel_sender.subscribe();
+
+            let channel_sender = self.channel_sender.clone();
 
             conns.spawn(serve_connection(
                 socket,
@@ -160,11 +161,10 @@ impl Server {
                 stop.clone(),
                 kill.clone(),
                 permit,
-                channel_receiver,
                 move || {
                     let conn_id = current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
                     println!("connect, {}", conn_id);
-                    SocketStatus::Channel(conn_id)
+                    (SocketStatus::Channel(conn_id), channel_sender.subscribe())
                 },
             ));
         }

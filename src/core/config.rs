@@ -104,6 +104,26 @@ impl BigBytesConfig {
             req_id_order: 3
         }
     }
+
+    pub fn validate(&self) -> Result<(), ()> {
+        let poses: [u8; 3] = [
+            self.options_len_order,
+            self.payload_len_order,
+            self.req_id_order
+        ];
+        if poses.contains(&0) {
+            return Err(());
+        }
+        for item in poses {
+            if poses.iter().filter(|&&x| x == item).count() > 1
+                || item > (3)
+            {
+                return Err(());
+            }
+        }
+        
+        Ok(())
+    }
 }
 
 pub const MIN_HEADER_LEN: u8 = 17;
@@ -139,6 +159,8 @@ impl FramerConfig {
                 return Err(());
             }
         }
+
+        self.big_bytes_config.validate()?;
 
         Result::Ok(())
     }
