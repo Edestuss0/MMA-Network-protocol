@@ -1,3 +1,4 @@
+
 #ifndef MMA_H
 #define MMA_H
 
@@ -7,6 +8,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 
 enum {
     MMA_OK = 0,
@@ -33,6 +35,12 @@ typedef struct MMA_Response {
 } MMA_Response;
 
 typedef struct {
+    uint8_t options_len_order;
+    uint8_t payload_len_order;
+    uint8_t req_id_order;
+} MMA_BigBytesConfig;
+
+typedef struct {
     uint32_t max_message_length;
     uint8_t opcode_pos;
     uint8_t version_pos;
@@ -43,6 +51,7 @@ typedef struct {
     uint8_t options_count_pos;
     uint8_t options_key_first;
     uint8_t header_length;
+    MMA_BigBytesConfig big_bytes_config;
 } MMA_FramerConfig;
 
 typedef struct {

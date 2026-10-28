@@ -1,5 +1,6 @@
 use crate::core::commands::{Request, Response, ResponseHeaders, ResponseOpcode};
 use crate::core::config::MMA_VERSION;
+use crate::core::router::RouteError::{Duplicate, InvalidName};
 use ahash::AHashMap;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
@@ -15,6 +16,16 @@ enum ReservedRoutes {
     CHANNEL_CONNECT,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RouteError {
+    #[error("route name is empty or too long")]
+    InvalidName,
+    #[error("route is reserved")]
+    Reserved,
+    #[error("route already exists")]
+    Duplicate,
+}
+
 #[derive(Clone)]
 pub struct Router {
     routes: AHashMap<String, Handler>,
@@ -28,18 +39,21 @@ impl Router {
             channel_handlers: AHashMap::new(),
         }
     }
-    pub fn register_route<F, Fut>(&mut self, route: impl Into<String>, handler: F) -> Result<(), ()>
+    pub fn register_route<F, Fut>(&mut self, route: String, handler: F) -> Result<(), RouteError>
     where
         F: Fn(Request, Response) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Response> + Send + 'static,
     {
-        let route = route.into();
+        if route.is_empty() || route.len() > u8::MAX as usize {
+            return Err(InvalidName);
+        }
 
-        if ReservedRoutes::from_str(&route.to_uppercase()).is_ok()
-            || self.routes.contains_key(&route)
-            || self.channel_handlers.contains_key(&route)
-        {
-            return Err(());
+        if ReservedRoutes::from_str(&route.to_uppercase()).is_ok() {
+            return Err(RouteError::Reserved);
+        }
+
+        if self.routes.contains_key(&route) || self.channel_handlers.contains_key(&route) {
+            return Err(Duplicate);
         }
 
         let handler: Handler = Arc::new(move |req, res| -> BoxFuture<'static, Response> {
@@ -50,17 +64,25 @@ impl Router {
         Ok(())
     }
 
-    pub fn register_channel_handler<F, Fut>(&mut self, route: String, handler: F) -> Result<(), ()>
+    pub fn register_channel_handler<F, Fut>(
+        &mut self,
+        route: String,
+        handler: F,
+    ) -> Result<(), RouteError>
     where
         F: Fn(Request, u32) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        if ReservedRoutes::from_str(route.to_uppercase().as_str()).is_ok() {
-            return Err(());
+        if route.is_empty() || route.len() > u8::MAX as usize {
+            return Err(InvalidName);
         }
 
-        if self.routes.contains_key(&route) || self.routes.contains_key(&route) {
-            return Err(());
+        if ReservedRoutes::from_str(&route.to_uppercase()).is_ok() {
+            return Err(RouteError::Reserved);
+        }
+
+        if self.routes.contains_key(&route) || self.channel_handlers.contains_key(&route) {
+            return Err(Duplicate);
         }
 
         let handler: ChannelHandler = Arc::new(move |req, conn_id| -> BoxFuture<'static, ()> {

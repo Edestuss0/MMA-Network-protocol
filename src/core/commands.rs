@@ -87,7 +87,7 @@ pub struct OptionValue {
     pub value: Bytes,
 }
 
-pub const RESPONSE_OPCODES_COUNT: usize = 10;
+pub const RESPONSE_OPCODES_COUNT: usize = 11;
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Copy)]
 pub enum ResponseOpcode {
@@ -147,6 +147,10 @@ impl Response {
             payload: Bytes::new(),
             options: vec![],
         }
+    }
+
+    pub fn set_status(&mut self, status: ResponseOpcode) {
+        self.headers.opcode = status;
     }
 
     pub fn graceful_shutdown_response(req_id: u32) -> Self {

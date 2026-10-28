@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 
 use crate::core::commands::{Request, Response, ResponseOpcode};
-use crate::core::config::{Config, FramerConfig};
+use crate::core::config::{BigBytesConfig, Config, FramerConfig};
 use crate::core::router::Router;
 use crate::core::server::Server;
 use bytes::Bytes;
@@ -32,6 +32,14 @@ pub struct MMA_FramerConfig {
     pub options_count_pos: u8,
     pub options_key_first: u8,
     pub header_length: u8,
+    pub big_bytes_config: MMA_BigBytesConfig
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MMA_BigBytesConfig {
+    pub payload_len_order: u8,
+    pub options_len_order: u8,
+    pub req_id_order: u8
 }
 
 #[repr(C)]
@@ -120,6 +128,7 @@ fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
         options_count_pos: config.options_count_pos,
         options_key_first: config.options_key_first != 0,
         header_length: config.header_length,
+        big_bytes_config: BigBytesConfig{options_len_order: config.big_bytes_config.options_len_order, payload_len_order: config.big_bytes_config.payload_len_order , req_id_order: config.big_bytes_config.req_id_order}
     })
 }
 
@@ -135,6 +144,7 @@ fn framer_config_to_c(config: &FramerConfig) -> MMA_FramerConfig {
         options_count_pos: config.options_count_pos,
         options_key_first: u8::from(config.options_key_first),
         header_length: config.header_length,
+        big_bytes_config: MMA_BigBytesConfig{options_len_order: config.big_bytes_config.options_len_order, payload_len_order: config.big_bytes_config.payload_len_order , req_id_order: config.big_bytes_config.req_id_order}
     }
 }
 
@@ -221,15 +231,15 @@ fn router_from_registrations(
                         let returned =
                             callback(request_view, response_view, user_data as *const c_void);
                         let returned_ptr = returned.response;
-                        let final_response = if returned_ptr.is_null() {
+                        
+                        if returned_ptr.is_null() {
                             unsafe {
                                 drop(Box::from_raw(response_ptr as *mut Response));
                             }
                             Response::internal_error(request_id)
                         } else {
                             unsafe { *Box::from_raw(returned_ptr) }
-                        };
-                        final_response
+                        }
                     })
                 },
             )
@@ -303,7 +313,7 @@ pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig
     if output.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
-    let framer = FramerConfig::new();
+    let framer = FramerConfig::default();
     let config = MMA_ServerConfig {
         bind_ip: c"0.0.0.0".as_ptr(),
         port: 8080,

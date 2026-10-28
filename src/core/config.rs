@@ -31,11 +31,11 @@ pub enum ConfigError {
     Port,
 }
 
-impl Config {
-    pub fn default() -> Self {
+impl Default for Config {
+    fn default() -> Self {
         Self {
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
-            frame_config: FramerConfig::new(),
+            frame_config: FramerConfig::default(),
             max_batch: 255,
             max_in_flight: 1024,
             max_connections: 128_000,
@@ -44,7 +44,9 @@ impl Config {
             request_timeout: Duration::from_secs(10),
         }
     }
+}
 
+impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_connections == 0 {
             return Err(MaxConnections);
@@ -84,6 +86,24 @@ pub struct FramerConfig {
     pub options_count_pos: u8,
     pub options_key_first: bool,
     pub header_length: u8,
+    pub big_bytes_config: BigBytesConfig
+}
+
+#[derive(Debug, Clone)]
+pub struct BigBytesConfig {
+    pub payload_len_order: u8,
+    pub options_len_order: u8,
+    pub req_id_order: u8
+}
+
+impl BigBytesConfig {
+    pub fn new() -> Self {
+        Self{
+            options_len_order: 1,
+            payload_len_order: 2,
+            req_id_order: 3
+        }
+    }
 }
 
 pub const MIN_HEADER_LEN: u8 = 17;
@@ -122,7 +142,10 @@ impl FramerConfig {
 
         Result::Ok(())
     }
-    pub fn new() -> Self {
+}
+
+impl Default for FramerConfig {
+    fn default() -> Self {
         Self {
             opcode_pos: 1,
             version_pos: 2,
@@ -134,12 +157,7 @@ impl FramerConfig {
             payload_order: 3,
             options_key_first: true,
             header_length: MIN_HEADER_LEN + RESERVED_SUFFIX,
+            big_bytes_config: BigBytesConfig::new()
         }
-    }
-}
-
-impl Default for FramerConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }

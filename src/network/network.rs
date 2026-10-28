@@ -13,11 +13,13 @@ use futures_util::{SinkExt, StreamExt};
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
@@ -53,7 +55,7 @@ impl SocketStatus {
 pub async fn serve_connection<F>(
     socket: TcpStream,
     router: Arc<Router>,
-    config: Config,
+    mut config_receiver: watch::Receiver<Config>,
     semaphore: Arc<Semaphore>,
     stop: CancellationToken,
     kill: CancellationToken,
@@ -63,7 +65,12 @@ pub async fn serve_connection<F>(
 ) where
     F: Fn() -> SocketStatus + Send + Sync + 'static,
 {
-    let framed = Framed::new(socket, Framer::new(config.frame_config));
+    let mut config = config_receiver.borrow_and_update().clone();
+
+    let framer_config = Arc::new(RwLock::new(config.frame_config.clone()));
+
+    let framed = Framed::new(socket, Framer::new(Arc::clone(&framer_config)));
+
     let (sink, mut stream) = framed.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<Response>(1000);
     let inflight = TaskTracker::new();
@@ -98,7 +105,27 @@ pub async fn serve_connection<F>(
             biased;
             _ = kill.cancelled() => break,
             _ = stop.cancelled() => break,
-            f = stream.next() => match f { Some(f) => f, None => break },
+            changed = config_receiver.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+
+                let next_config = config_receiver
+                    .borrow_and_update()
+                    .clone();
+
+                {
+                    let mut current = framer_config
+                        .write()
+                        .expect("Framer config lock poisoned");
+
+                    *current = next_config.frame_config.clone();
+                }
+
+                config = next_config;
+                continue;
+            }
+            f = stream.next() => match f { Some(f) => f, None => break},
         };
 
         match frame {
@@ -117,9 +144,11 @@ pub async fn serve_connection<F>(
                 let socket_status = Arc::clone(&socket_status);
                 let req_id = cmd.headers.req_id;
 
+                let request_timeout = config.request_timeout;
+
                 inflight.spawn(async move {
                     match tokio::time::timeout(
-                        config.request_timeout,
+                        request_timeout,
                         handle_cmd(
                             cmd,
                             socket_status,
@@ -131,11 +160,10 @@ pub async fn serve_connection<F>(
                     .await
                     {
                         Ok(r) => {
-                            if r.is_some() {
-                                if let Err(e) = tx.send(r.unwrap()).await {
+                            if r.is_some()
+                                && let Err(e) = tx.send(r.unwrap()).await {
                                     eprintln!("{}", e);
                                 }
-                            }
                         }
                         Err(_) => {
                             if let Err(e) = tx.send(Response::timeout(req_id)).await {
@@ -168,7 +196,6 @@ pub async fn serve_connection<F>(
                 {
                     eprintln!("Error with sending to socket: {:?}", e);
                 }
-                break;
             }
         }
     }
@@ -289,7 +316,7 @@ fn writer(
     mut rx: Receiver<Response>,
     max_batch: u32,
 ) -> tokio::task::JoinHandle<()> {
-    return tokio::spawn(async move {
+    tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let Err(e) = sink.feed(frame).await {
                 match e {
@@ -386,5 +413,5 @@ fn writer(
             }
         }
         let _ = sink.close().await;
-    });
+    })
 }

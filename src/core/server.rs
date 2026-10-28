@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -22,11 +23,14 @@ pub struct Server {
     tcp_listener: TcpListener,
     stop: CancellationToken,
     channel_sender: broadcast::Sender<ChannelSendedMessage>,
+    config_receiver: watch::Receiver<Config>,
+    config_sender: watch::Sender<Config>,
 }
 
 #[derive(Clone)]
 pub struct ServerHandle {
     channel_sender: broadcast::Sender<ChannelSendedMessage>,
+    config_sender: watch::Sender<Config>,
 }
 
 impl ServerHandle {
@@ -35,6 +39,19 @@ impl ServerHandle {
         if let Err(_) = sender.send(ChannelSendedMessage { message, conn_id }) {
             return Err(());
         }
+        Result::Ok(())
+    }
+
+    pub fn change_config(&self, config: Config) -> Result<(), std::io::Error> {
+        Server::validate_config(&config)?;
+
+        self.config_sender.send(config).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Cannot update config: no active receivers",
+            )
+        })?;
+
         Ok(())
     }
 }
@@ -49,6 +66,7 @@ impl Server {
     pub fn handle(&self) -> ServerHandle {
         ServerHandle {
             channel_sender: self.channel_sender.clone(),
+            config_sender: self.config_sender.clone(),
         }
     }
 
@@ -58,11 +76,14 @@ impl Server {
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
         let (channel_sender, _) = broadcast::channel::<ChannelSendedMessage>(1024);
+        let (config_sender, config_receiver) = watch::channel::<Config>(config.clone());
         Result::Ok(Self {
             config,
             tcp_listener,
             stop: CancellationToken::new(),
             channel_sender,
+            config_receiver,
+            config_sender,
         })
     }
 
@@ -134,7 +155,7 @@ impl Server {
             conns.spawn(serve_connection(
                 socket,
                 Arc::clone(&router),
-                self.config.clone(),
+                self.config_receiver.clone(),
                 Arc::clone(&semaphore),
                 stop.clone(),
                 kill.clone(),

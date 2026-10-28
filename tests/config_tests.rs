@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use MMA::core::config::{Config, FramerConfig, MIN_HEADER_LEN, RESERVED_SUFFIX};
+use MMA::core::config::{BigBytesConfig, Config, FramerConfig, MIN_HEADER_LEN, RESERVED_SUFFIX};
 
 fn valid_config() -> Config {
     Config::default()
@@ -31,7 +31,7 @@ fn server_config_rejects_zero_limits_and_port() {
 
 #[test]
 fn framer_config_accepts_minimum_header_and_permutations() {
-    let mut config = FramerConfig::new();
+    let mut config = FramerConfig::default();
     config.header_length = MIN_HEADER_LEN + RESERVED_SUFFIX;
     assert!(config.validate().is_ok());
     for positions in [(1, 2, 3, 4), (4, 3, 2, 1), (13, 14, 15, 16)] {
@@ -56,13 +56,14 @@ fn framer_config_rejects_bad_header_positions() {
         options_order: 1,
         payload_order: 2,
         route_order: 1,
+        big_bytes_config: BigBytesConfig::new()
     };
     assert!(base.validate().is_err());
 }
 
 #[test]
 fn framer_config_rejects_bad_body_orders() {
-    let base = FramerConfig::new();
+    let base = FramerConfig::default();
     for mutate in [
         |c: &mut FramerConfig| c.route_order = 0,
         |c: &mut FramerConfig| c.payload_order = 0,
