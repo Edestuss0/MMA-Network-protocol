@@ -94,7 +94,7 @@ impl Router {
         Result::Ok(())
     }
 
-    fn validate_version(frame: &Request) -> Result<(), Response> {
+    pub fn validate_version(frame: &Request) -> Result<(), Response> {
         if frame.headers.version != MMA_VERSION {
             return Err(Response {
                 headers: ResponseHeaders {

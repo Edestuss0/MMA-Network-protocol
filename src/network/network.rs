@@ -38,18 +38,17 @@ impl SocketStatus {
     fn to_u64(self) -> u64 {
         match self {
             SocketStatus::Fresh => 0,
-            SocketStatus::Once => 1,
-            SocketStatus::Channel(id) => (2 << 32) | (id as u64),
+            SocketStatus::Once => 1_u64 << 32,
+            SocketStatus::Channel(id) => (2_u64 << 32) | u64::from(id),
         }
     }
 
-    fn from_u64(val: u64) -> Self {
-        let tag = val >> 32;
-        match tag {
+    fn from_u64(value: u64) -> Self {
+        match value >> 32 {
             0 => SocketStatus::Fresh,
             1 => SocketStatus::Once,
-            2 => SocketStatus::Channel(val as u32),
-            _ => unreachable!(),
+            2 => SocketStatus::Channel(value as u32),
+            _ => SocketStatus::Fresh,
         }
     }
 }
@@ -232,6 +231,7 @@ pub async fn serve_connection<F>(
                 {
                     eprintln!("Error with sending to socket: {:?}", e);
                 }
+                break;
             }
         }
     }
@@ -271,6 +271,10 @@ where
     F: Fn() -> SocketStatus + Send + Sync + 'static,
 {
     let req_id = cmd.headers.req_id;
+
+    if let Err(e) = Router::validate_version(&cmd) {
+        return Some(e);
+    }
 
     match SocketStatus::from_u64(socket_status.load(Ordering::Relaxed)) {
         SocketStatus::Fresh => match cmd.headers.opcode {

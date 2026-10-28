@@ -307,10 +307,6 @@ static int32_t register_routes(MMA_Server *server)
 
 int main(void)
 {
-    /*
-     * Блокируем SIGINT/SIGTERM до создания фоновых потоков.
-     * sigwait() ниже ожидает сигналы без busy-wait и гонки с pause().
-     */
     sigset_t signal_set;
 
     if (sigemptyset(&signal_set) != 0 ||

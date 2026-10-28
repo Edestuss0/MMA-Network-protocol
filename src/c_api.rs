@@ -93,7 +93,7 @@ pub struct MMA_Response {
 pub type MMA_RouteCallback =
     Option<extern "C" fn(MMA_Request, MMA_Response, *const c_void) -> MMA_Response>;
 pub type MMA_ChannelHandlerCallback =
-    Option<extern "C" fn(*const MMA_Request, u32, *mut c_void) -> i32>;
+    Option<extern "C" fn(*const MMA_Request, u32, *const c_void) -> i32>;
 
 struct RegisteredRoute {
     route: String,
@@ -103,7 +103,7 @@ struct RegisteredRoute {
 
 struct RegisteredChannelHandler {
     route: String,
-    callback: extern "C" fn(*const MMA_Request, u32, *mut c_void) -> i32,
+    callback: extern "C" fn(*const MMA_Request, u32, *const c_void) -> i32,
     user_data: usize,
 }
 
@@ -197,15 +197,14 @@ unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
 fn router_from_registrations(
     routes: &[RegisteredRoute],
     channel_handlers: &[RegisteredChannelHandler],
-) -> Router {
+) -> Result<Router, String> {
     let mut router = Router::new();
     for route in routes {
         let callback = route.callback;
         let route_name = route.route.clone();
         let user_data = route.user_data;
         let route_name_clone = route_name.clone();
-        if router
-            .register_route(
+        router.register_route(
                 route.route.clone(),
                 move |request: Request, response: Response| {
                     let route_name = route_name_clone.clone();
@@ -254,17 +253,13 @@ fn router_from_registrations(
                         }
                     })
                 },
-            )
-            .is_err()
-        {
-            continue;
-        }
+            ).map_err(|error| format!("route {:?}: {error}", route.route))?;
     }
     for handler in channel_handlers {
         let callback = handler.callback;
         let route_name = handler.route.clone();
         let user_data = handler.user_data;
-        let _ = router.register_channel_handler(
+        router.register_channel_handler(
             handler.route.clone(),
             move |request: Request, conn_id: u32| {
                 let route_name = route_name.clone();
@@ -302,9 +297,9 @@ fn router_from_registrations(
                     }
                 }
             },
-        );
+        ).map_err(|error| format!("channel route {:?}: {error}", handler.route))?;
     }
-    router
+    Ok(router)
 }
 
 unsafe fn response_mut<'a>(response: MMA_Response) -> Result<&'a mut Response, i32> {
@@ -434,7 +429,7 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
     route: *const u8,
     route_len: usize,
     callback: MMA_ChannelHandlerCallback,
-    user_data: *mut c_void,
+    user_data: *const c_void,
 ) -> i32 {
     if server.is_null() || !valid_slice(route, route_len) {
         return MMA_INVALID_ARGUMENT;
@@ -488,10 +483,15 @@ pub unsafe extern "C" fn mma_server_start(
     }
 
     let config = server.config.clone();
-    let router = router_from_registrations(
+    let router = match router_from_registrations(
         &server.routes,
         &server.channel_handlers,
-    );
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            return MMA_SERVER_ERROR;
+        }
+    };
 
     let stop = server.stop.clone();
 
@@ -768,6 +768,7 @@ pub unsafe extern "C" fn mma_response_set_status(
         Ok(response) => response,
         Err(_) => return response_error(),
     };
+    
     response.headers.opcode = opcode;
     MMA_Response {
         response: response_ptr,
