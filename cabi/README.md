@@ -1,18 +1,16 @@
 # Go bindings for the MMA Rust C ABI
 
-Package `cabi` is a thin Go wrapper around the functions already exported by
-`include/mma.h`. The protocol engine and server remain in Rust. The wrapper
-only converts configuration/request/response types, owns C pointers, and bridges
-callbacks from Rust to Go using a C trampoline and `runtime/cgo.Handle`.
+`github.com/Edestuss0/MMA-Network-protocol/cabi` is a Go wrapper around the existing native API in `include/mma.h`. The Rust protocol engine and its C ABI are not reimplemented or modified by the Go binding.
 
-## Native requirement
+## Consumer requirements
 
-The implementation requires cgo, a compatible C compiler, and the built Rust
-shared library. With `CGO_ENABLED=0`, `native_nocgo.go` keeps IDE/type checking
-working but every native operation returns `ErrCGODisabled`; it is not a Go
-fallback implementation.
+- Go 1.25 or later.
+- A supported OS/architecture: Windows amd64, Linux amd64, macOS amd64 or arm64.
+- Internet access on the first native API call, so the matching prebuilt Rust shared library and callback bridge can be downloaded from the GitHub release and cached. No Rust, Cargo, GCC, MinGW, MSVC, or CGO is required by the application using this package.
 
-See [`../INSTALL.txt`](../INSTALL.txt) for Windows, Linux and macOS build steps.
+The native artifact is selected from the dependency's module version when available. For local development, you can set `MMA_NATIVE_VERSION` to a release tag or `MMA_NATIVE_DIR` to a directory that contains both the native library and matching callback bridge (`MMA.dll` + `mma_go_bridge.dll`, `libMMA.so` + `libmma_go_bridge.so`, or `libMMA.dylib` + `libmma_go_bridge.dylib`). Set `MMA_NATIVE_REFRESH=1` before starting the process to redownload the cached artifact. The artifact zip and its SHA-256 checksum are verified before installation.
+
+The maintainer workflow [`.github/workflows/native-release.yml`](../.github/workflows/native-release.yml) builds the native libraries and pointer-based callback bridge on GitHub Actions and attaches them to a version release. The bridge adapts the C route callback that passes structs by value; the Rust C ABI and `include/mma.h` remain unchanged. Push a tag such as `v0.1.0` to run it. Until a release with the corresponding native assets exists, consumers cannot initialize the native API from GitHub; use `MMA_NATIVE_DIR` for local testing.
 
 ## Example
 
@@ -57,11 +55,18 @@ func main() {
 
 ## Wrapped C ABI operations
 
-- Native default config and server creation/start/stop/destroy.
+- Native defaults and server creation/start/stop/destroy.
 - Route and channel-handler registration.
 - Native response status/payload/options operations.
-- `MMA_ServerHandle` retrieval, channel send and runtime config update.
+- `MMA_ServerHandle` retrieval, channel sends and runtime configuration changes.
 
-The current C ABI does not export standalone framer create/encode/decode
-functions. `FramerConfig` is passed through the native server configuration;
-no protocol framer is reimplemented in Go.
+The current C ABI does not export standalone framer encode/decode functions. `FramerConfig` is passed through the native server configuration; framing remains entirely inside Rust. Go calls the unmodified C ABI using `purego`. The route callback passes through a prebuilt C bridge because purego callbacks cannot receive/return C structs by value on Windows; the bridge uses pointer arguments on the Go side.
+
+## Tests
+
+`go test ./cabi` runs Go-side tests without downloading native binaries. Native integration test(s) are opt-in:
+
+```powershell
+$env:MMA_NATIVE_DIR = "D:\path\to\directory\with\both\libraries"
+go test -tags native_integration ./cabi
+```

@@ -1,0 +1,154 @@
+name: Build and publish MMA native libraries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            goos: windows
+            goarch: amd64
+            library: MMA.dll
+            asset: mma-native-windows-amd64.zip
+            static_crt: 'true'
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            library: libMMA.so
+            asset: mma-native-linux-amd64.zip
+            static_crt: 'false'
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            goos: darwin
+            goarch: amd64
+            library: libMMA.dylib
+            asset: mma-native-darwin-amd64.zip
+            static_crt: 'false'
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            library: libMMA.dylib
+            asset: mma-native-darwin-arm64.zip
+            static_crt: 'false'
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: ${{ matrix.static_crt == 'true' && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build Rust cdylib
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build callback bridge (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseDir = "target/${{ matrix.target }}/release"
+          $library = Join-Path $releaseDir "${{ matrix.library }}"
+          if (!(Test-Path $library)) { throw "Native library not found: $library" }
+          $importLibrary = Join-Path $releaseDir "MMA.dll.lib"
+          if (!(Test-Path $importLibrary)) { throw "MMA.dll.lib import library not found in $releaseDir" }
+          cl.exe /nologo /O2 /MT /LD /I include /Fo:"$releaseDir\mma_go_bridge.obj" native-bridge\bridge.c /link /LIBPATH:"$releaseDir" "$importLibrary" /OUT:"$releaseDir\mma_go_bridge.dll"
+          if (!(Test-Path (Join-Path $releaseDir "mma_go_bridge.dll"))) { throw "Callback bridge was not built" }
+
+      - name: Build callback bridge (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="target/${{ matrix.target }}/release"
+          cc -O2 -fPIC -shared -I include native-bridge/bridge.c -L "$release_dir" -lMMA -Wl,-rpath,'$ORIGIN' -o "$release_dir/libmma_go_bridge.so"
+
+      - name: Build callback bridge (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="target/${{ matrix.target }}/release"
+          clang -O2 -dynamiclib -I include native-bridge/bridge.c -L "$release_dir" -lMMA -Wl,-rpath,@loader_path -o "$release_dir/libmma_go_bridge.dylib"
+
+      - name: Package native libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseDir = "target/${{ matrix.target }}/release"
+          $library = Join-Path $releaseDir "${{ matrix.library }}"
+          $bridge = Join-Path $releaseDir "mma_go_bridge.dll"
+          if (!(Test-Path $library)) { throw "Native library not found: $library" }
+          if (!(Test-Path $bridge)) { throw "Callback bridge not found: $bridge" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $stage = Join-Path $env:RUNNER_TEMP "mma-native-package"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $library (Join-Path $stage "${{ matrix.library }}")
+          Copy-Item $bridge (Join-Path $stage "mma_go_bridge.dll")
+          $archive = Join-Path $PWD "dist/${{ matrix.asset }}"
+          Push-Location $stage
+          try { Compress-Archive -Path "${{ matrix.library }}", "mma_go_bridge.dll" -DestinationPath $archive -CompressionLevel Optimal }
+          finally { Pop-Location }
+          $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $([System.IO.Path]::GetFileName($archive))" | Set-Content "$archive.sha256" -Encoding ascii
+
+      - name: Package native libraries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="target/${{ matrix.target }}/release"
+          library="$release_dir/${{ matrix.library }}"
+          case "${{ matrix.goos }}" in
+            linux) bridge="$release_dir/libmma_go_bridge.so" ;;
+            darwin) bridge="$release_dir/libmma_go_bridge.dylib" ;;
+          esac
+          test -f "$library" || { echo "Native library not found: $library"; exit 1; }
+          test -f "$bridge" || { echo "Callback bridge not found: $bridge"; exit 1; }
+          mkdir -p dist
+          archive="dist/${{ matrix.asset }}"
+          zip -j "$archive" "$library" "$bridge"
+          sha256sum "$archive" > "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Attach native libraries to release
+    needs: build-native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -1,62 +1,70 @@
 MMA Go C ABI wrapper
 ====================
 
-The `cabi` package calls the existing Rust C ABI declared in `include/mma.h`.
-It does not reimplement the protocol or the Rust engine. A C compiler and cgo
-are required to run the native implementation.
+The package `github.com/Edestuss0/MMA-Network-protocol/cabi` calls the existing
+Rust C ABI in `include/mma.h` through purego. The public header and Rust C ABI
+are not changed, and the protocol implementation remains in Rust.
 
-IMPORTANT: if `CGO_ENABLED=0`, Go selects `cabi/native_nocgo.go`. That file is
-only a type-checking stub for IDEs and returns `cabi.ErrCGODisabled`; it does
-not provide a working server. The real wrapper is in `cabi/native.go`.
+Using the package
+-----------------
+Consumers need Go 1.25+ and a supported OS/architecture (Windows amd64, Linux
+amd64, macOS amd64 or arm64). They do not need Rust, Cargo, CGO, GCC, MinGW or
+MSVC. On the first native call, the package downloads the Rust shared library plus a small callback bridge for the selected module
+release, verifies the ZIP SHA-256 checksum, and caches both files in the
+user's OS cache directory.
 
-Windows (64-bit, MinGW/GNU toolchain)
-------------------------------------
-1. Install a MinGW-w64 GCC that is on PATH, and verify `gcc --version` works.
-2. Make the Go cgo toolchain match the Rust GNU target:
+Example consumer setup:
 
-   go env -w CGO_ENABLED=1
-   rustup target add x86_64-pc-windows-gnu
-   cargo build --release --target x86_64-pc-windows-gnu
+    go get github.com/Edestuss0/MMA-Network-protocol/cabi@v0.1.0
 
-3. From the repository root in PowerShell:
+Then import it normally:
 
-   $env:PATH = "$PWD\target\x86_64-pc-windows-gnu\release;$env:PATH"
-   go test ./cabi
+    import "github.com/Edestuss0/MMA-Network-protocol/cabi"
 
-The `PATH` entry is needed at runtime so Windows can load `MMA.dll`. Go's
-architecture and Rust target must match. This configuration uses the GNU
-Rust target because cgo's GCC linker does not generally link directly against
-an MSVC-target library.
+The version above is illustrative; use a version that has been published.
 
-Linux
------
-From the repository root:
+Environment variables
+---------------------
+MMA_NATIVE_VERSION  Override the native release tag. Useful for local testing.
+MMA_NATIVE_DIR      Load prebuilt native files from a local directory instead
+                    of downloading them. The directory must contain both files:
+                    MMA.dll + mma_go_bridge.dll (Windows), libMMA.so +
+                    libmma_go_bridge.so (Linux), or libMMA.dylib +
+                    libmma_go_bridge.dylib (macOS).
+MMA_NATIVE_REFRESH  Set to 1 to redownload the cached artifact before startup.
 
-   cargo build --release
-   export CGO_ENABLED=1
-   export LD_LIBRARY_PATH="$PWD/target/release${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-   go test ./cabi
+Publishing a release
+--------------------
+1. Push the code and the tag to GitHub, for example:
 
-macOS
------
-From the repository root:
+       git add .
+       git commit -m "Add compiler-free Go bindings"
+       git push origin master
+       git tag v0.1.0
+       git push origin v0.1.0
 
-   cargo build --release
-   export CGO_ENABLED=1
-   export DYLD_LIBRARY_PATH="$PWD/target/release${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
-   go test ./cabi
+2. The workflow `.github/workflows/native-release.yml` builds precompiled
+   Rust shared libraries and the C callback bridge for Windows amd64, Linux
+   amd64, macOS amd64 and macOS arm64, then uploads each ZIP and SHA-256
+   checksum to that GitHub release. The bridge exists only to adapt the route
+   callback ABI for a CGO-free Go caller; `include/mma.h` and the Rust C ABI
+   are unchanged.
+3. Users import the `cabi` package. They do not run Cargo or compile C code.
 
-API overview
-------------
-- `DefaultServerConfig`, `NewServer`, `Server.Start`, `Server.Stop`,
-  `Server.Close`, `Server.BoundPort`.
-- `Server.RegisterRoute` / `Server.Handle` for request-response routes.
-- `Server.RegisterChannelHandler` for messages on channel routes.
-- `Server.GetHandle`, `ServerHandle.SendToChannel`, `ServerHandle.ChangeConfig`.
-- `ResponseBuilder.SetStatus`, `SetPayload`, `AddOption`.
+The repository must have a release with the matching platform assets before
+users can initialize the native API. While developing locally, build both the Rust shared library and matching callback bridge on the
+developer machine, put both files in one folder and set MMA_NATIVE_DIR to that
+folder, or wait for the GitHub release workflow to publish the artifacts.
 
-Register routes before starting the server. Rust calls Go handlers through a C
-trampoline and `runtime/cgo.Handle`; request memory is copied into Go-owned
-values during the callback. Do not retain `ResponseBuilder` beyond the route
-handler. Handlers can run concurrently and must synchronize their own shared
-state.
+Testing
+-------
+Regular Go-only tests:
+
+    go test ./cabi
+
+Native integration tests (requires local library or a published release):
+
+    go test -tags native_integration ./cabi
+
+No standalone Framer implementation is added in Go: the protocol framing and
+server engine continue to run in Rust.

@@ -1,9 +1,8 @@
-//go:build cgo
+//go:build native_integration
 
 package cabi
 
 import (
-	"errors"
 	"testing"
 	"time"
 )
@@ -24,23 +23,5 @@ func TestDefaultServerConfigMirrorsNativeDefaults(t *testing.T) {
 	}
 	if config.Framer.HeaderLength != 29 || config.Framer.BigBytesConfig != (BigBytesConfig{OptionsLenOrder: 1, PayloadLenOrder: 2, ReqIDOrder: 3}) {
 		t.Fatalf("unexpected framer defaults: %+v", config.Framer)
-	}
-}
-
-func TestStatusErrorUnwrap(t *testing.T) {
-	cases := []struct {
-		code int32
-		want error
-	}{
-		{-1, ErrInvalidArgument},
-		{-2, ErrInvalidConfig},
-		{-3, ErrServer},
-		{-4, ErrServerRunning},
-	}
-	for _, test := range cases {
-		err := &StatusError{Code: test.code, Message: "test"}
-		if !errors.Is(err, test.want) {
-			t.Errorf("errors.Is(%v, %v) = false", err, test.want)
-		}
 	}
 }

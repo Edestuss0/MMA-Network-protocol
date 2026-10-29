@@ -1,41 +1,231 @@
-//go:build cgo
-
 package cabi
-
-/*
-#cgo CFLAGS: -I${SRCDIR}/../include
-#cgo linux LDFLAGS: -L${SRCDIR}/../target/release -lMMA
-#cgo darwin LDFLAGS: -L${SRCDIR}/../target/release -lMMA
-#cgo windows LDFLAGS: -L${SRCDIR}/../target/release -L${SRCDIR}/../target/x86_64-pc-windows-gnu/release -lMMA
-
-#include "bridge.h"
-#include <stdlib.h>
-#include <stdint.h>
-*/
-import "C"
 
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"runtime"
-	"runtime/cgo"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
-// DefaultServerConfig returns the configuration supplied by the native library.
-func DefaultServerConfig() (ServerConfig, error) {
-	var native C.MMA_ServerConfig
-	if err := statusError(int32(C.mma_server_config_default(&native))); err != nil {
-		return ServerConfig{}, err
-	}
-	return serverConfigFromC(native), nil
+// The following structs mirror include/mma.h's #[repr(C)] Rust types.
+// Keep their field order and alignment in sync with the public C ABI.
+type nativeBigBytesConfig struct {
+	optionsLenOrder uint8
+	payloadLenOrder uint8
+	reqIDOrder      uint8
 }
 
-// DefaultFramerConfig returns the framer settings from the native server defaults.
-// The current C ABI exposes FramerConfig only as part of MMA_ServerConfig.
+type nativeFramerConfig struct {
+	maxMessageLength uint32
+	opcodePos        uint8
+	versionPos       uint8
+	routeLenPos      uint8
+	routeOrder       uint8
+	payloadOrder     uint8
+	optionsOrder     uint8
+	optionsCountPos  uint8
+	optionsKeyFirst  uint8
+	headerLength     uint8
+	bigBytesConfig   nativeBigBytesConfig
+}
+
+type nativeServerConfig struct {
+	bindIP           unsafe.Pointer
+	port             uint16
+	maxBatch         uint32
+	maxInFlight      uint32
+	framer           nativeFramerConfig
+	maxConnections   uint32
+	drainTimeoutMS   uint64
+	shutdownGraceMS  uint64
+	requestTimeoutMS uint64
+}
+
+type nativeOption struct {
+	key      unsafe.Pointer
+	keyLen   uintptr
+	value    unsafe.Pointer
+	valueLen uintptr
+}
+
+type nativeRequest struct {
+	route        unsafe.Pointer
+	routeLen     uintptr
+	opcode       uint8
+	version      uint8
+	requestID    uint32
+	payload      unsafe.Pointer
+	payloadLen   uintptr
+	options      unsafe.Pointer
+	optionsCount uintptr
+}
+
+type nativeResponse struct {
+	inner unsafe.Pointer // Same pointer-sized ABI field as MMA_Response in mma.h.
+}
+
+type nativeAPI struct {
+	library uintptr
+	bridge  uintptr
+
+	bridgeSetRouteCallback    func(uintptr) int32
+	serverConfigDefault       func(unsafe.Pointer) int32
+	serverCreate              func(unsafe.Pointer, unsafe.Pointer) int32
+	serverLocalPort           func(unsafe.Pointer, unsafe.Pointer) int32
+	serverRegisterRoute       func(unsafe.Pointer, unsafe.Pointer, uintptr, uintptr) int32
+	serverRegisterChannel     func(unsafe.Pointer, unsafe.Pointer, uintptr, uintptr, uintptr) int32
+	serverStart               func(unsafe.Pointer) int32
+	serverStop                func(unsafe.Pointer) int32
+	serverDestroy             func(unsafe.Pointer)
+	serverGetHandle           func(unsafe.Pointer, unsafe.Pointer) int32
+	serverHandleDestroy       func(unsafe.Pointer)
+	serverHandleSendToChannel func(unsafe.Pointer, uint32, nativeResponse) int32
+	serverHandleChangeConfig  func(unsafe.Pointer, unsafe.Pointer) int32
+	responseNew               func(uint32) nativeResponse
+	responseDestroy           func(nativeResponse)
+	responseSetStatus         func(nativeResponse, uint8) nativeResponse
+	responseSetPayload        func(nativeResponse, unsafe.Pointer, uintptr) nativeResponse
+	responseAddOption         func(nativeResponse, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr) nativeResponse
+
+	routeCallback   uintptr
+	channelCallback uintptr
+}
+
+var (
+	apiMu     sync.Mutex
+	loadedAPI *nativeAPI
+
+	nextCallbackID atomic.Uint64
+	callbackTable  sync.Map // uintptr -> RouteHandler or ChannelHandler
+)
+
+func getNativeAPI() (*nativeAPI, error) {
+	apiMu.Lock()
+	defer apiMu.Unlock()
+	if loadedAPI != nil {
+		return loadedAPI, nil
+	}
+
+	libraryPath, err := locateNativeLibrary()
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS == "windows" {
+		addDLLSearchPath(filepath.Dir(libraryPath))
+	}
+	library, err := openNativeLibrary(libraryPath)
+	if err != nil {
+		return nil, fmt.Errorf("load MMA native library %q: %w", libraryPath, err)
+	}
+
+	bridgePath := filepath.Join(filepath.Dir(libraryPath), nativeBridgeLibraryName())
+	bridge, err := openNativeLibrary(bridgePath)
+	if err != nil {
+		_ = closeNativeLibrary(library)
+		return nil, fmt.Errorf("load MMA callback bridge %q: %w", bridgePath, err)
+	}
+
+	api := &nativeAPI{library: library, bridge: bridge}
+	bindings := []struct {
+		library uintptr
+		name    string
+		fn      any
+	}{
+		{bridge, "mma_go_bridge_set_route_callback", &api.bridgeSetRouteCallback},
+		{bridge, "mma_go_server_register_route", &api.serverRegisterRoute},
+		{library, "mma_server_config_default", &api.serverConfigDefault},
+		{library, "mma_server_create", &api.serverCreate},
+		{library, "mma_server_local_port", &api.serverLocalPort},
+		{library, "mma_server_register_channel_handler", &api.serverRegisterChannel},
+		{library, "mma_server_start", &api.serverStart},
+		{library, "mma_server_stop", &api.serverStop},
+		{library, "mma_server_destroy", &api.serverDestroy},
+		{library, "mma_server_get_handle", &api.serverGetHandle},
+		{library, "mma_server_handle_destroy", &api.serverHandleDestroy},
+		{library, "mma_server_handle_send_to_channel", &api.serverHandleSendToChannel},
+		{library, "mma_server_handle_change_config", &api.serverHandleChangeConfig},
+		{library, "mma_response_new", &api.responseNew},
+		{library, "mma_response_destroy", &api.responseDestroy},
+		{library, "mma_response_set_status", &api.responseSetStatus},
+		{library, "mma_response_set_payload", &api.responseSetPayload},
+		{library, "mma_response_add_option", &api.responseAddOption},
+	}
+	for _, binding := range bindings {
+		if err := bindNativeFunction(binding.library, binding.name, binding.fn); err != nil {
+			_ = closeNativeLibrary(bridge)
+			_ = closeNativeLibrary(library)
+			return nil, err
+		}
+	}
+
+	var callbackErr error
+	api.routeCallback, callbackErr = createNativeCallback(nativeRouteCallback)
+	if callbackErr != nil {
+		_ = closeNativeLibrary(bridge)
+		_ = closeNativeLibrary(library)
+		return nil, fmt.Errorf("create MMA route callback: %w", callbackErr)
+	}
+	api.channelCallback, callbackErr = createNativeCallback(nativeChannelCallback)
+	if callbackErr != nil {
+		_ = closeNativeLibrary(bridge)
+		_ = closeNativeLibrary(library)
+		return nil, fmt.Errorf("create MMA channel callback: %w", callbackErr)
+	}
+	if err := statusError(api.bridgeSetRouteCallback(api.routeCallback)); err != nil {
+		_ = closeNativeLibrary(bridge)
+		_ = closeNativeLibrary(library)
+		return nil, fmt.Errorf("register Go route callback with bridge: %w", err)
+	}
+
+	loadedAPI = api
+	return api, nil
+}
+
+func bindNativeFunction(library uintptr, name string, fn any) (err error) {
+	address, err := lookupNativeSymbol(library, name)
+	if err != nil {
+		return fmt.Errorf("resolve MMA symbol %q: %w", name, err)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("bind MMA symbol %q: %v", name, recovered)
+		}
+	}()
+	purego.RegisterFunc(fn, address)
+	return nil
+}
+
+func createNativeCallback(fn any) (callback uintptr, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("purego callback ABI is unsupported on %s/%s: %v", runtime.GOOS, runtime.GOARCH, recovered)
+		}
+	}()
+	return purego.NewCallback(fn), nil
+}
+
+// DefaultServerConfig returns defaults supplied by the Rust C ABI.
+func DefaultServerConfig() (ServerConfig, error) {
+	api, err := getNativeAPI()
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	var native nativeServerConfig
+	if err := statusError(api.serverConfigDefault(unsafe.Pointer(&native))); err != nil {
+		return ServerConfig{}, err
+	}
+	return serverConfigFromNative(native), nil
+}
+
+// DefaultFramerConfig returns the native default framer settings.
 func DefaultFramerConfig() (FramerConfig, error) {
 	config, err := DefaultServerConfig()
 	if err != nil {
@@ -44,117 +234,141 @@ func DefaultFramerConfig() (FramerConfig, error) {
 	return config.Framer, nil
 }
 
-func serverConfigFromC(native C.MMA_ServerConfig) ServerConfig {
-	bindIP := ""
-	if native.bind_ip != nil {
-		bindIP = C.GoString(native.bind_ip)
-	}
+func serverConfigFromNative(native nativeServerConfig) ServerConfig {
 	return ServerConfig{
-		BindIP:         bindIP,
-		Port:           uint16(native.port),
-		MaxBatch:       uint32(native.max_batch),
-		MaxInFlight:    uint32(native.max_in_flight),
-		Framer:         framerConfigFromC(native.framer),
-		MaxConnections: uint32(native.max_connections),
-		DrainTimeout:   time.Duration(native.drain_timeout_ms) * time.Millisecond,
-		ShutdownGrace:  time.Duration(native.shutdown_grace_ms) * time.Millisecond,
-		RequestTimeout: time.Duration(native.request_timeout_ms) * time.Millisecond,
+		BindIP:         cString(native.bindIP),
+		Port:           native.port,
+		MaxBatch:       native.maxBatch,
+		MaxInFlight:    native.maxInFlight,
+		Framer:         framerConfigFromNative(native.framer),
+		MaxConnections: native.maxConnections,
+		DrainTimeout:   time.Duration(native.drainTimeoutMS) * time.Millisecond,
+		ShutdownGrace:  time.Duration(native.shutdownGraceMS) * time.Millisecond,
+		RequestTimeout: time.Duration(native.requestTimeoutMS) * time.Millisecond,
 	}
 }
 
-func framerConfigFromC(native C.MMA_FramerConfig) FramerConfig {
+func framerConfigFromNative(native nativeFramerConfig) FramerConfig {
 	return FramerConfig{
-		MaxMessageLength: uint32(native.max_message_length),
-		OpcodePos:        uint8(native.opcode_pos),
-		VersionPos:       uint8(native.version_pos),
-		RouteLenPos:      uint8(native.route_len_pos),
-		RouteOrder:       uint8(native.route_order),
-		PayloadOrder:     uint8(native.payload_order),
-		OptionsOrder:     uint8(native.options_order),
-		OptionsCountPos:  uint8(native.options_count_pos),
-		OptionsKeyFirst:  native.options_key_first != 0,
-		HeaderLength:     uint8(native.header_length),
+		MaxMessageLength: native.maxMessageLength,
+		OpcodePos:        native.opcodePos,
+		VersionPos:       native.versionPos,
+		RouteLenPos:      native.routeLenPos,
+		RouteOrder:       native.routeOrder,
+		PayloadOrder:     native.payloadOrder,
+		OptionsOrder:     native.optionsOrder,
+		OptionsCountPos:  native.optionsCountPos,
+		OptionsKeyFirst:  native.optionsKeyFirst != 0,
+		HeaderLength:     native.headerLength,
 		BigBytesConfig: BigBytesConfig{
-			OptionsLenOrder: uint8(native.big_bytes_config.options_len_order),
-			PayloadLenOrder: uint8(native.big_bytes_config.payload_len_order),
-			ReqIDOrder:      uint8(native.big_bytes_config.req_id_order),
+			OptionsLenOrder: native.bigBytesConfig.optionsLenOrder,
+			PayloadLenOrder: native.bigBytesConfig.payloadLenOrder,
+			ReqIDOrder:      native.bigBytesConfig.reqIDOrder,
 		},
 	}
 }
 
-func framerConfigToC(config FramerConfig) C.MMA_FramerConfig {
-	return C.MMA_FramerConfig{
-		max_message_length: C.uint32_t(config.MaxMessageLength),
-		opcode_pos:         C.uint8_t(config.OpcodePos),
-		version_pos:        C.uint8_t(config.VersionPos),
-		route_len_pos:      C.uint8_t(config.RouteLenPos),
-		route_order:        C.uint8_t(config.RouteOrder),
-		payload_order:      C.uint8_t(config.PayloadOrder),
-		options_order:      C.uint8_t(config.OptionsOrder),
-		options_count_pos:  C.uint8_t(config.OptionsCountPos),
-		options_key_first:  boolToCUint8(config.OptionsKeyFirst),
-		header_length:      C.uint8_t(config.HeaderLength),
-		big_bytes_config: C.MMA_BigBytesConfig{
-			options_len_order: C.uint8_t(config.BigBytesConfig.OptionsLenOrder),
-			payload_len_order: C.uint8_t(config.BigBytesConfig.PayloadLenOrder),
-			req_id_order:      C.uint8_t(config.BigBytesConfig.ReqIDOrder),
+func framerConfigToNative(config FramerConfig) nativeFramerConfig {
+	return nativeFramerConfig{
+		maxMessageLength: config.MaxMessageLength,
+		opcodePos:        config.OpcodePos,
+		versionPos:       config.VersionPos,
+		routeLenPos:      config.RouteLenPos,
+		routeOrder:       config.RouteOrder,
+		payloadOrder:     config.PayloadOrder,
+		optionsOrder:     config.OptionsOrder,
+		optionsCountPos:  config.OptionsCountPos,
+		optionsKeyFirst:  boolToUint8(config.OptionsKeyFirst),
+		headerLength:     config.HeaderLength,
+		bigBytesConfig: nativeBigBytesConfig{
+			optionsLenOrder: config.BigBytesConfig.OptionsLenOrder,
+			payloadLenOrder: config.BigBytesConfig.PayloadLenOrder,
+			reqIDOrder:      config.BigBytesConfig.ReqIDOrder,
 		},
 	}
 }
 
-func serverConfigToC(config ServerConfig) (C.MMA_ServerConfig, *C.char, error) {
-	if config.BindIP == "" {
-		return C.MMA_ServerConfig{}, nil, fmt.Errorf("%w: BindIP must not be empty", ErrInvalidArgument)
+func serverConfigToNative(config ServerConfig, bindIP []byte) (nativeServerConfig, error) {
+	if config.BindIP == "" || strings.IndexByte(config.BindIP, 0) >= 0 {
+		return nativeServerConfig{}, fmt.Errorf("%w: BindIP must be non-empty and cannot contain NUL", ErrInvalidArgument)
 	}
 	if config.DrainTimeout < 0 || config.ShutdownGrace < 0 || config.RequestTimeout < 0 {
-		return C.MMA_ServerConfig{}, nil, fmt.Errorf("%w: timeouts must not be negative", ErrInvalidConfig)
+		return nativeServerConfig{}, fmt.Errorf("%w: timeouts must not be negative", ErrInvalidConfig)
 	}
-	bindIP := C.CString(config.BindIP)
-	native := C.MMA_ServerConfig{
-		bind_ip:            bindIP,
-		port:               C.uint16_t(config.Port),
-		max_batch:          C.uint32_t(config.MaxBatch),
-		max_in_flight:      C.uint32_t(config.MaxInFlight),
-		framer:             framerConfigToC(normalizeFramerConfig(config.Framer)),
-		max_connections:    C.uint32_t(config.MaxConnections),
-		drain_timeout_ms:   C.uint64_t(config.DrainTimeout / time.Millisecond),
-		shutdown_grace_ms:  C.uint64_t(config.ShutdownGrace / time.Millisecond),
-		request_timeout_ms: C.uint64_t(config.RequestTimeout / time.Millisecond),
-	}
-	return native, bindIP, nil
+	return nativeServerConfig{
+		bindIP:           byteSlicePointer(bindIP),
+		port:             config.Port,
+		maxBatch:         config.MaxBatch,
+		maxInFlight:      config.MaxInFlight,
+		framer:           framerConfigToNative(normalizeFramerConfig(config.Framer)),
+		maxConnections:   config.MaxConnections,
+		drainTimeoutMS:   uint64(config.DrainTimeout / time.Millisecond),
+		shutdownGraceMS:  uint64(config.ShutdownGrace / time.Millisecond),
+		requestTimeoutMS: uint64(config.RequestTimeout / time.Millisecond),
+	}, nil
 }
 
-func boolToCUint8(value bool) C.uint8_t {
+func boolToUint8(value bool) uint8 {
 	if value {
 		return 1
 	}
 	return 0
 }
 
-// Server owns an MMA_Server allocated by the Rust library.
+func byteSlicePointer(data []byte) unsafe.Pointer {
+	if len(data) == 0 {
+		return nil
+	}
+	return unsafe.Pointer(&data[0])
+}
+
+func cString(pointer unsafe.Pointer) string {
+	if pointer == nil {
+		return ""
+	}
+	const maxCStringLength = 1 << 20
+	for length := 0; length < maxCStringLength; length++ {
+		if *(*byte)(unsafe.Add(pointer, length)) == 0 {
+			return string(unsafe.Slice((*byte)(pointer), length))
+		}
+	}
+	return ""
+}
+
+// Server owns an MMA_Server allocated by the Rust shared library.
 type Server struct {
 	mu          sync.Mutex
 	lifecycleMu sync.Mutex
-	ptr         *C.MMA_Server
-	handles     []cgo.Handle
+	api         *nativeAPI
+	ptr         unsafe.Pointer
+	handles     []uintptr
 	stopping    bool
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
-	nativeConfig, bindIP, err := serverConfigToC(config)
+	api, err := getNativeAPI()
 	if err != nil {
 		return nil, err
 	}
-	defer C.free(unsafe.Pointer(bindIP))
-
-	var ptr *C.MMA_Server
-	if err := statusError(int32(C.mma_server_create(&nativeConfig, &ptr))); err != nil {
+	bindIP := append([]byte(config.BindIP), 0)
+	nativeConfig, err := serverConfigToNative(config, bindIP)
+	if err != nil {
 		return nil, err
 	}
-	if ptr == nil {
+	var pointer unsafe.Pointer
+	status := api.serverCreate(
+		unsafe.Pointer(&nativeConfig),
+		unsafe.Pointer(&pointer),
+	)
+	runtime.KeepAlive(bindIP)
+	runtime.KeepAlive(&nativeConfig)
+	if err := statusError(status); err != nil {
+		return nil, err
+	}
+	if pointer == nil {
 		return nil, errors.New("mma_server_create returned a nil pointer")
 	}
-	server := &Server{ptr: ptr}
+	server := &Server{api: api, ptr: pointer}
 	runtime.SetFinalizer(server, (*Server).finalize)
 	return server, nil
 }
@@ -166,35 +380,29 @@ func (s *Server) RegisterRoute(route string, handler RouteHandler) error {
 	if s == nil {
 		return ErrClosed
 	}
-	if handler == nil || len(route) == 0 || len(route) > 255 || !utf8.ValidString(route) {
+	if handler == nil || len(route) == 0 || len(route) > 255 || !utf8.ValidString(route) || strings.IndexByte(route, 0) >= 0 {
 		return ErrInvalidArgument
 	}
-	handle := cgo.NewHandle(handler)
 	routeBytes := []byte(route)
-	routePtr := C.CBytes(routeBytes)
-	defer C.free(routePtr)
+	id := keepCallback(handler)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr == nil {
-		handle.Delete()
+		releaseCallback(id)
 		return ErrClosed
 	}
 	if s.stopping {
-		handle.Delete()
+		releaseCallback(id)
 		return ErrServer
 	}
-	status := C.mma_server_register_go_route(
-		s.ptr,
-		(*C.uint8_t)(routePtr),
-		C.size_t(len(routeBytes)),
-		C.mma_handle_to_ptr(C.uintptr_t(handle)),
-	)
-	if err := statusError(int32(status)); err != nil {
-		handle.Delete()
+	status := s.api.serverRegisterRoute(s.ptr, byteSlicePointer(routeBytes), uintptr(len(routeBytes)), id)
+	runtime.KeepAlive(routeBytes)
+	if err := statusError(status); err != nil {
+		releaseCallback(id)
 		return err
 	}
-	s.handles = append(s.handles, handle)
+	s.handles = append(s.handles, id)
 	return nil
 }
 
@@ -203,40 +411,34 @@ func (s *Server) Handle(route string, handler RouteHandler) error {
 	return s.RegisterRoute(route, handler)
 }
 
-// RegisterChannelHandler registers a handler for messages on a channel route.
+// RegisterChannelHandler registers a handler for messages delivered to a channel route.
 func (s *Server) RegisterChannelHandler(route string, handler ChannelHandler) error {
 	if s == nil {
 		return ErrClosed
 	}
-	if handler == nil || len(route) == 0 || len(route) > 255 || !utf8.ValidString(route) {
+	if handler == nil || len(route) == 0 || len(route) > 255 || !utf8.ValidString(route) || strings.IndexByte(route, 0) >= 0 {
 		return ErrInvalidArgument
 	}
-	handle := cgo.NewHandle(handler)
 	routeBytes := []byte(route)
-	routePtr := C.CBytes(routeBytes)
-	defer C.free(routePtr)
+	id := keepCallback(handler)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr == nil {
-		handle.Delete()
+		releaseCallback(id)
 		return ErrClosed
 	}
 	if s.stopping {
-		handle.Delete()
+		releaseCallback(id)
 		return ErrServer
 	}
-	status := C.mma_server_register_go_channel_handler(
-		s.ptr,
-		(*C.uint8_t)(routePtr),
-		C.size_t(len(routeBytes)),
-		C.mma_handle_to_ptr(C.uintptr_t(handle)),
-	)
-	if err := statusError(int32(status)); err != nil {
-		handle.Delete()
+	status := s.api.serverRegisterChannel(s.ptr, byteSlicePointer(routeBytes), uintptr(len(routeBytes)), s.api.channelCallback, id)
+	runtime.KeepAlive(routeBytes)
+	if err := statusError(status); err != nil {
+		releaseCallback(id)
 		return err
 	}
-	s.handles = append(s.handles, handle)
+	s.handles = append(s.handles, id)
 	return nil
 }
 
@@ -251,10 +453,10 @@ func (s *Server) Start() error {
 	if s.ptr == nil {
 		return ErrClosed
 	}
-	return statusError(int32(C.mma_server_start(s.ptr)))
+	return statusError(s.api.serverStart(s.ptr))
 }
 
-// BoundPort returns the configured/listener port reported by the native server.
+// BoundPort returns the listener port reported by the native server.
 func (s *Server) BoundPort() (uint16, error) {
 	if s == nil {
 		return 0, ErrClosed
@@ -267,15 +469,14 @@ func (s *Server) BoundPort() (uint16, error) {
 	if s.stopping {
 		return 0, ErrServer
 	}
-	var port C.uint16_t
-	if err := statusError(int32(C.mma_server_local_port(s.ptr, &port))); err != nil {
+	var port uint16
+	if err := statusError(s.api.serverLocalPort(s.ptr, unsafe.Pointer(&port))); err != nil {
 		return 0, err
 	}
-	return uint16(port), nil
+	return port, nil
 }
 
-// GetHandle returns a separately owned handle that can send channel messages
-// and change the running server's configuration.
+// GetHandle returns a separately owned native handle for channel sends and config updates.
 func (s *Server) GetHandle() (*ServerHandle, error) {
 	if s == nil {
 		return nil, ErrClosed
@@ -288,20 +489,19 @@ func (s *Server) GetHandle() (*ServerHandle, error) {
 	if s.stopping {
 		return nil, ErrServer
 	}
-	var ptr *C.MMA_ServerHandle
-	if err := statusError(int32(C.mma_server_get_handle(s.ptr, &ptr))); err != nil {
+	var pointer unsafe.Pointer
+	if err := statusError(s.api.serverGetHandle(s.ptr, unsafe.Pointer(&pointer))); err != nil {
 		return nil, err
 	}
-	if ptr == nil {
+	if pointer == nil {
 		return nil, errors.New("mma_server_get_handle returned a nil pointer")
 	}
-	handle := &ServerHandle{ptr: ptr}
+	handle := &ServerHandle{api: s.api, ptr: pointer}
 	runtime.SetFinalizer(handle, (*ServerHandle).finalize)
 	return handle, nil
 }
 
 // Stop stops the native server but keeps the wrapper allocated until Close.
-// The native API does not support starting the same server instance again.
 func (s *Server) Stop() error {
 	if s == nil {
 		return nil
@@ -309,22 +509,22 @@ func (s *Server) Stop() error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
-	ptr := s.ptr
-	if ptr == nil {
+	pointer := s.ptr
+	if pointer == nil {
 		s.mu.Unlock()
 		return nil
 	}
 	s.stopping = true
 	s.mu.Unlock()
 
-	err := statusError(int32(C.mma_server_stop(ptr)))
+	err := statusError(s.api.serverStop(pointer))
 	s.mu.Lock()
 	s.stopping = false
 	s.mu.Unlock()
 	return err
 }
 
-// Close releases the server and its registered Go callback handles.
+// Close destroys the native server and then releases its callback registrations.
 func (s *Server) Close() error {
 	if s == nil {
 		return nil
@@ -333,28 +533,29 @@ func (s *Server) Close() error {
 	defer s.lifecycleMu.Unlock()
 
 	s.mu.Lock()
-	ptr := s.ptr
+	pointer := s.ptr
 	s.ptr = nil
 	s.stopping = true
 	handles := s.handles
 	s.handles = nil
 	s.mu.Unlock()
 	runtime.SetFinalizer(s, nil)
-	if ptr == nil {
+	if pointer == nil {
 		return nil
 	}
-	// Native destroy stops and joins the server thread before callbacks are released.
-	C.mma_server_destroy(ptr)
-	for _, handle := range handles {
-		handle.Delete()
+	// The native destroy joins its server thread before callback values are discarded.
+	s.api.serverDestroy(pointer)
+	for _, id := range handles {
+		releaseCallback(id)
 	}
 	return nil
 }
 
-// ServerHandle is an independently owned handle for runtime server operations.
+// ServerHandle is independently owned by the native server runtime.
 type ServerHandle struct {
 	mu  sync.Mutex
-	ptr *C.MMA_ServerHandle
+	api *nativeAPI
+	ptr unsafe.Pointer
 }
 
 func (h *ServerHandle) finalize() { _ = h.Close() }
@@ -364,17 +565,17 @@ func (h *ServerHandle) Close() error {
 		return nil
 	}
 	h.mu.Lock()
-	ptr := h.ptr
+	pointer := h.ptr
 	h.ptr = nil
 	h.mu.Unlock()
 	runtime.SetFinalizer(h, nil)
-	if ptr != nil {
-		C.mma_server_handle_destroy(ptr)
+	if pointer != nil {
+		h.api.serverHandleDestroy(pointer)
 	}
 	return nil
 }
 
-// SendToChannel sends a message to a connected channel client.
+// SendToChannel sends a message to an established channel connection.
 func (h *ServerHandle) SendToChannel(connectionID uint32, message Response) error {
 	if h == nil {
 		return ErrClosed
@@ -384,68 +585,72 @@ func (h *ServerHandle) SendToChannel(connectionID uint32, message Response) erro
 	if h.ptr == nil {
 		return ErrClosed
 	}
-	response := C.mma_response_new(C.uint32_t(message.ReqID))
+	response := h.api.responseNew(message.ReqID)
 	if response.inner == nil {
 		return errors.New("mma_response_new returned a nil response")
 	}
-	defer C.mma_response_destroy(response)
+	defer h.api.responseDestroy(response)
 
 	opcode := message.Opcode
 	if opcode == 0 {
 		opcode = StatusMessage
 	}
-	response = C.mma_response_set_status(response, C.uint8_t(opcode))
+	response = h.api.responseSetStatus(response, uint8(opcode))
 	if response.inner == nil {
 		return fmt.Errorf("%w: unsupported response opcode %d", ErrInvalidArgument, opcode)
 	}
-	response, err := setNativeResponsePayload(response, message.Payload)
+	var err error
+	response, err = setNativeResponsePayload(h.api, response, message.Payload)
 	if err != nil {
 		return err
 	}
 	for _, option := range message.Options {
-		response, err = addNativeResponseOption(response, option.Key, option.Value)
+		response, err = addNativeResponseOption(h.api, response, option.Key, option.Value)
 		if err != nil {
 			return err
 		}
 	}
-	return statusError(int32(C.mma_server_handle_send_to_channel(h.ptr, C.uint32_t(connectionID), response)))
+	return statusError(h.api.serverHandleSendToChannel(h.ptr, connectionID, response))
 }
 
-// ChangeConfig applies a new configuration to the running server.
+// ChangeConfig applies an updated configuration to the running server.
 func (h *ServerHandle) ChangeConfig(config ServerConfig) error {
 	if h == nil {
 		return ErrClosed
 	}
-	nativeConfig, bindIP, err := serverConfigToC(config)
+	bindIP := append([]byte(config.BindIP), 0)
+	nativeConfig, err := serverConfigToNative(config, bindIP)
 	if err != nil {
 		return err
 	}
-	defer C.free(unsafe.Pointer(bindIP))
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.ptr == nil {
 		return ErrClosed
 	}
-	return statusError(int32(C.mma_server_handle_change_config(h.ptr, &nativeConfig)))
+	err = statusError(h.api.serverHandleChangeConfig(h.ptr, unsafe.Pointer(&nativeConfig)))
+	runtime.KeepAlive(bindIP)
+	runtime.KeepAlive(&nativeConfig)
+	return err
 }
 
-// ResponseBuilder mutates the native response for a route callback. It is only
-// valid for the duration of RouteHandler.
+// ResponseBuilder updates the response object owned by the native library.
+// It is borrowed and valid only during RouteHandler execution.
 type ResponseBuilder struct {
-	ptr *C.MMA_Response
+	api      *nativeAPI
+	response nativeResponse
 }
 
-// SetStatus accepts an optional legacy version argument. The native ABI no
-// longer exposes a response-version setter, so version is ignored.
+// SetStatus accepts a legacy optional version argument; the current C ABI sets protocol version itself.
 func (b *ResponseBuilder) SetStatus(opcode ResponseOpcode, _ ...uint8) error {
-	if b == nil || b.ptr == nil || b.ptr.inner == nil {
+	if b == nil || b.api == nil || b.response.inner == nil {
 		return ErrInvalidArgument
 	}
-	updated := C.mma_response_set_status(*b.ptr, C.uint8_t(opcode))
+	updated := b.api.responseSetStatus(b.response, uint8(opcode))
 	if updated.inner == nil {
 		return fmt.Errorf("%w: unsupported response opcode %d", ErrInvalidArgument, opcode)
 	}
-	*b.ptr = updated
+	b.response = updated
 	return nil
 }
 
@@ -454,74 +659,64 @@ func (b *ResponseBuilder) SetStatusBuilder(opcode ResponseOpcode, version ...uin
 }
 
 func (b *ResponseBuilder) SetPayload(payload []byte) error {
-	if b == nil || b.ptr == nil || b.ptr.inner == nil {
+	if b == nil || b.api == nil || b.response.inner == nil {
 		return ErrInvalidArgument
 	}
-	updated, err := setNativeResponsePayload(*b.ptr, payload)
+	updated, err := setNativeResponsePayload(b.api, b.response, payload)
 	if err != nil {
 		return err
 	}
-	*b.ptr = updated
+	b.response = updated
 	return nil
 }
 
 func (b *ResponseBuilder) AddOption(key, value string) error {
-	if b == nil || b.ptr == nil || b.ptr.inner == nil {
+	if b == nil || b.api == nil || b.response.inner == nil {
 		return ErrInvalidArgument
 	}
-	updated, err := addNativeResponseOption(*b.ptr, key, value)
+	updated, err := addNativeResponseOption(b.api, b.response, key, value)
 	if err != nil {
 		return err
 	}
-	*b.ptr = updated
+	b.response = updated
 	return nil
 }
 
-func setNativeResponsePayload(response C.MMA_Response, payload []byte) (C.MMA_Response, error) {
-	var ptr unsafe.Pointer
-	if len(payload) > 0 {
-		ptr = C.CBytes(payload)
-		defer C.free(ptr)
-	}
-	updated := C.mma_response_set_payload(response, (*C.uint8_t)(ptr), C.size_t(len(payload)))
+func setNativeResponsePayload(api *nativeAPI, response nativeResponse, payload []byte) (nativeResponse, error) {
+	updated := api.responseSetPayload(response, byteSlicePointer(payload), uintptr(len(payload)))
+	runtime.KeepAlive(payload)
 	if updated.inner == nil {
 		return response, ErrInvalidArgument
 	}
 	return updated, nil
 }
 
-func addNativeResponseOption(response C.MMA_Response, key, value string) (C.MMA_Response, error) {
-	if key == "" || value == "" {
-		return response, fmt.Errorf("%w: option key and value must not be empty", ErrInvalidArgument)
+func addNativeResponseOption(api *nativeAPI, response nativeResponse, key, value string) (nativeResponse, error) {
+	if key == "" || value == "" || strings.IndexByte(key, 0) >= 0 || strings.IndexByte(value, 0) >= 0 {
+		return response, fmt.Errorf("%w: option key and value must not be empty or contain NUL", ErrInvalidArgument)
 	}
-	keyPtr := C.CBytes([]byte(key))
-	valuePtr := C.CBytes([]byte(value))
-	defer C.free(keyPtr)
-	defer C.free(valuePtr)
-	updated := C.mma_response_add_option(
-		response,
-		(*C.uint8_t)(keyPtr), C.size_t(len(key)),
-		(*C.uint8_t)(valuePtr), C.size_t(len(value)),
-	)
+	keyBytes, valueBytes := []byte(key), []byte(value)
+	updated := api.responseAddOption(response,
+		byteSlicePointer(keyBytes), uintptr(len(keyBytes)),
+		byteSlicePointer(valueBytes), uintptr(len(valueBytes)))
+	runtime.KeepAlive(keyBytes)
+	runtime.KeepAlive(valueBytes)
 	if updated.inner == nil {
 		return response, ErrInvalidArgument
 	}
 	return updated, nil
 }
 
-func requestFromC(native *C.MMA_Request) (*Request, error) {
-	if native == nil {
-		return nil, ErrInvalidArgument
-	}
-	routeBytes, err := copyFromC(native.route, native.route_len)
+func requestFromNative(native nativeRequest) (*Request, error) {
+	route, err := copyNativeBytes(native.route, native.routeLen)
 	if err != nil {
 		return nil, err
 	}
-	payload, err := copyFromC(native.payload, native.payload_len)
+	payload, err := copyNativeBytes(native.payload, native.payloadLen)
 	if err != nil {
 		return nil, err
 	}
-	count, err := cSizeToInt(native.options_count)
+	count, err := nativeSizeToInt(native.optionsCount)
 	if err != nil || count > 255 {
 		return nil, ErrInvalidArgument
 	}
@@ -530,13 +725,13 @@ func requestFromC(native *C.MMA_Request) (*Request, error) {
 	}
 	options := make([]Option, 0, count)
 	if count > 0 {
-		nativeOptions := unsafe.Slice(native.options, count)
+		nativeOptions := unsafe.Slice((*nativeOption)(native.options), count)
 		for _, option := range nativeOptions {
-			key, err := copyFromC(option.key, option.key_len)
+			key, err := copyNativeBytes(option.key, option.keyLen)
 			if err != nil {
 				return nil, err
 			}
-			value, err := copyFromC(option.value, option.value_len)
+			value, err := copyNativeBytes(option.value, option.valueLen)
 			if err != nil {
 				return nil, err
 			}
@@ -545,116 +740,146 @@ func requestFromC(native *C.MMA_Request) (*Request, error) {
 	}
 	return &Request{
 		Opcode:  RequestOpcode(native.opcode),
-		Version: uint8(native.version),
-		ReqID:   uint32(native.request_id),
-		Route:   string(routeBytes),
+		Version: native.version,
+		ReqID:   native.requestID,
+		Route:   string(route),
 		Options: options,
 		Payload: payload,
 	}, nil
 }
 
-func copyFromC(ptr *C.uint8_t, size C.size_t) ([]byte, error) {
-	n, err := cSizeToInt(size)
+func copyNativeBytes(pointer unsafe.Pointer, size uintptr) ([]byte, error) {
+	n, err := nativeSizeToInt(size)
 	if err != nil {
 		return nil, err
 	}
 	if n == 0 {
 		return nil, nil
 	}
-	if ptr == nil {
+	if pointer == nil {
 		return nil, ErrInvalidArgument
 	}
-	source := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n)
 	result := make([]byte, n)
-	copy(result, source)
+	copy(result, unsafe.Slice((*byte)(pointer), n))
 	return result, nil
 }
 
-func cSizeToInt(size C.size_t) (int, error) {
-	maxInt := int(^uint(0) >> 1)
-	if uint64(size) > uint64(maxInt) {
-		return 0, errors.New("C size_t value does not fit into Go int")
+func nativeSizeToInt(size uintptr) (int, error) {
+	maxInt := uintptr(^uint(0) >> 1)
+	if size > maxInt {
+		return 0, errors.New("native size_t value does not fit into Go int")
 	}
 	return int(size), nil
 }
 
-func setCallbackError(response *C.MMA_Response, opcode ResponseOpcode, message string) {
-	if response == nil || response.inner == nil {
-		return
+func keepCallback(callback any) uintptr {
+	id := uintptr(nextCallbackID.Add(1))
+	if id == 0 {
+		id = uintptr(nextCallbackID.Add(1))
 	}
-	builder := &ResponseBuilder{ptr: response}
-	if err := builder.SetStatus(opcode); err != nil {
-		return
-	}
-	_ = builder.SetPayload([]byte(message))
+	callbackTable.Store(id, callback)
+	return id
 }
 
-//export go_mma_route_callback
-func go_mma_route_callback(request *C.MMA_Request, response *C.MMA_Response, userData unsafe.Pointer) (status C.int32_t) {
-	status = C.int32_t(C.MMA_OK)
+func releaseCallback(id uintptr) { callbackTable.Delete(id) }
+
+func callbackByID(id uintptr) (any, bool) { return callbackTable.Load(id) }
+
+func nativeRouteCallback(_ purego.CDecl, requestPointer unsafe.Pointer, responsePointer unsafe.Pointer, userData uintptr) (result int32) {
+	if responsePointer == nil {
+		return nativeStatusInvalidArgument
+	}
+	response := (*nativeResponse)(responsePointer)
+	result = nativeStatusOK
 	defer func() {
 		if recover() != nil {
-			setCallbackError(response, StatusInternalError, "Internal server error")
-			status = C.int32_t(C.MMA_OK)
+			if api, err := getNativeAPI(); err == nil {
+				*response = setCallbackError(api, *response, StatusInternalError, "Internal server error")
+				result = nativeStatusOK
+			} else {
+				result = nativeStatusServerError
+			}
 		}
 	}()
-	if response == nil || response.inner == nil {
-		return C.int32_t(C.MMA_INVALID_ARGUMENT)
-	}
-	handleValue := uintptr(C.mma_ptr_to_handle(userData))
-	if handleValue == 0 {
-		setCallbackError(response, StatusInternalError, "Internal server error")
-		return status
-	}
-	handler, ok := cgo.Handle(handleValue).Value().(RouteHandler)
-	if !ok || handler == nil {
-		setCallbackError(response, StatusInternalError, "Internal server error")
-		return status
-	}
-	goRequest, err := requestFromC(request)
+
+	api, err := getNativeAPI()
 	if err != nil {
-		setCallbackError(response, StatusBadRequest, "Invalid request")
-		return status
+		return nativeStatusServerError
 	}
-	builder := &ResponseBuilder{ptr: response}
+	if requestPointer == nil {
+		*response = setCallbackError(api, *response, StatusBadRequest, "Invalid request")
+		return nativeStatusOK
+	}
+	value, ok := callbackByID(userData)
+	handler, isRouteHandler := value.(RouteHandler)
+	if !ok || !isRouteHandler || handler == nil {
+		*response = setCallbackError(api, *response, StatusInternalError, "Internal server error")
+		return nativeStatusOK
+	}
+	goRequest, err := requestFromNative(*(*nativeRequest)(requestPointer))
+	if err != nil {
+		*response = setCallbackError(api, *response, StatusBadRequest, "Invalid request")
+		return nativeStatusOK
+	}
+	builder := &ResponseBuilder{api: api, response: *response}
 	if err := handler(goRequest, builder); err != nil {
-		setCallbackError(response, StatusInternalError, "Internal server error")
+		builder.response = setCallbackError(api, builder.response, StatusInternalError, "Internal server error")
 	}
-	return status
+	*response = builder.response
+	return nativeStatusOK
 }
 
-//export go_mma_channel_callback
-func go_mma_channel_callback(request *C.MMA_Request, connectionID C.uint32_t, userData unsafe.Pointer) (status C.int32_t) {
-	status = C.int32_t(C.MMA_SERVER_ERROR)
+func nativeChannelCallback(_ purego.CDecl, requestPointer unsafe.Pointer, connectionID uint32, userData uintptr) (result int32) {
+	result = nativeStatusServerError
 	defer func() {
 		if recover() != nil {
-			status = C.int32_t(C.MMA_SERVER_ERROR)
+			result = nativeStatusServerError
 		}
 	}()
-	if request == nil {
-		return C.int32_t(C.MMA_INVALID_ARGUMENT)
+	if requestPointer == nil {
+		return nativeStatusInvalidArgument
 	}
-	handleValue := uintptr(C.mma_ptr_to_handle(userData))
-	if handleValue == 0 {
-		return C.int32_t(C.MMA_INVALID_ARGUMENT)
+	value, ok := callbackByID(userData)
+	handler, isChannelHandler := value.(ChannelHandler)
+	if !ok || !isChannelHandler || handler == nil {
+		return nativeStatusInvalidArgument
 	}
-	handler, ok := cgo.Handle(handleValue).Value().(ChannelHandler)
-	if !ok || handler == nil {
-		return C.int32_t(C.MMA_INVALID_ARGUMENT)
-	}
-	goRequest, err := requestFromC(request)
+	request, err := requestFromNative(*(*nativeRequest)(requestPointer))
 	if err != nil {
-		return C.int32_t(C.MMA_INVALID_ARGUMENT)
+		return nativeStatusInvalidArgument
 	}
-	if err := handler(goRequest, uint32(connectionID)); err != nil {
-		return C.int32_t(C.MMA_SERVER_ERROR)
+	if err := handler(request, connectionID); err != nil {
+		return nativeStatusServerError
 	}
-	return C.int32_t(C.MMA_OK)
+	return nativeStatusOK
 }
 
-// normalizeFramerConfig fills the default ordering when callers leave only the
-// nested big-bytes ordering unspecified. The rest of the configuration is left
-// unchanged so the native validator can report invalid configurations.
+const (
+	nativeStatusOK              int32 = 0
+	nativeStatusInvalidArgument int32 = -1
+	nativeStatusServerError     int32 = -3
+)
+
+func setCallbackError(api *nativeAPI, response nativeResponse, opcode ResponseOpcode, message string) (result nativeResponse) {
+	result = response
+	defer func() { _ = recover() }()
+	if result.inner == nil {
+		return result
+	}
+	result = api.responseSetStatus(result, uint8(opcode))
+	if result.inner == nil {
+		return result
+	}
+	payload := []byte(message)
+	updated := api.responseSetPayload(result, byteSlicePointer(payload), uintptr(len(payload)))
+	runtime.KeepAlive(payload)
+	if updated.inner != nil {
+		result = updated
+	}
+	return result
+}
+
+// normalizeFramerConfig supplies the C ABI's default nested ordering when omitted.
 func normalizeFramerConfig(config FramerConfig) FramerConfig {
 	if config.BigBytesConfig == (BigBytesConfig{}) {
 		config.BigBytesConfig = BigBytesConfig{

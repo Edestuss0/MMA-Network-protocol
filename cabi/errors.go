@@ -15,7 +15,8 @@ var (
 	ErrServerRunning   = errors.New("server is already running")
 	ErrCallback        = errors.New("route callback failed")
 	ErrClosed          = errors.New("object is closed")
-	ErrCGODisabled     = errors.New("MMA C ABI requires cgo; enable CGO_ENABLED=1 and install a C compiler")
+	// Deprecated: the current wrapper uses purego and no longer has a CGO-disabled mode.
+	ErrCGODisabled = errors.New("legacy CGO wrapper is disabled")
 )
 
 type StatusError struct {
