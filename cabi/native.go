@@ -785,16 +785,28 @@ func releaseCallback(id uintptr) { callbackTable.Delete(id) }
 
 func callbackByID(id uintptr) (any, bool) { return callbackTable.Load(id) }
 
-func nativeRouteCallback(_ purego.CDecl, requestPointer unsafe.Pointer, responsePointer unsafe.Pointer, userData uintptr) (result int32) {
-	if responsePointer == nil {
+func nativeRouteCallback(
+	_ purego.CDecl,
+	requestPointer uintptr,
+	responsePointer uintptr,
+	userData uintptr,
+) (result uintptr) {
+	if responsePointer == 0 {
 		return nativeStatusInvalidArgument
 	}
-	response := (*nativeResponse)(responsePointer)
+
+	response := (*nativeResponse)(unsafe.Pointer(responsePointer))
 	result = nativeStatusOK
+
 	defer func() {
 		if recover() != nil {
 			if api, err := getNativeAPI(); err == nil {
-				*response = setCallbackError(api, *response, StatusInternalError, "Internal server error")
+				*response = setCallbackError(
+					api,
+					*response,
+					StatusInternalError,
+					"Internal server error",
+				)
 				result = nativeStatusOK
 			} else {
 				result = nativeStatusServerError
@@ -806,58 +818,104 @@ func nativeRouteCallback(_ purego.CDecl, requestPointer unsafe.Pointer, response
 	if err != nil {
 		return nativeStatusServerError
 	}
-	if requestPointer == nil {
-		*response = setCallbackError(api, *response, StatusBadRequest, "Invalid request")
+
+	if requestPointer == 0 {
+		*response = setCallbackError(
+			api,
+			*response,
+			StatusBadRequest,
+			"Invalid request",
+		)
 		return nativeStatusOK
 	}
+
 	value, ok := callbackByID(userData)
 	handler, isRouteHandler := value.(RouteHandler)
+
 	if !ok || !isRouteHandler || handler == nil {
-		*response = setCallbackError(api, *response, StatusInternalError, "Internal server error")
+		*response = setCallbackError(
+			api,
+			*response,
+			StatusInternalError,
+			"Internal server error",
+		)
 		return nativeStatusOK
 	}
-	goRequest, err := requestFromNative(*(*nativeRequest)(requestPointer))
+
+	goRequest, err := requestFromNative(
+		*(*nativeRequest)(unsafe.Pointer(requestPointer)),
+	)
 	if err != nil {
-		*response = setCallbackError(api, *response, StatusBadRequest, "Invalid request")
+		*response = setCallbackError(
+			api,
+			*response,
+			StatusBadRequest,
+			"Invalid request",
+		)
 		return nativeStatusOK
 	}
-	builder := &ResponseBuilder{api: api, response: *response}
-	if err := handler(goRequest, builder); err != nil {
-		builder.response = setCallbackError(api, builder.response, StatusInternalError, "Internal server error")
+
+	builder := &ResponseBuilder{
+		api:      api,
+		response: *response,
 	}
+
+	if err := handler(goRequest, builder); err != nil {
+		builder.response = setCallbackError(
+			api,
+			builder.response,
+			StatusInternalError,
+			"Internal server error",
+		)
+	}
+
 	*response = builder.response
 	return nativeStatusOK
 }
 
-func nativeChannelCallback(_ purego.CDecl, requestPointer unsafe.Pointer, connectionID uint32, userData uintptr) (result int32) {
+func nativeChannelCallback(
+	_ purego.CDecl,
+	requestPointer uintptr,
+	connectionID uintptr,
+	userData uintptr,
+) (result uintptr) {
 	result = nativeStatusServerError
+
 	defer func() {
 		if recover() != nil {
 			result = nativeStatusServerError
 		}
 	}()
-	if requestPointer == nil {
+
+	if requestPointer == 0 {
 		return nativeStatusInvalidArgument
 	}
+
 	value, ok := callbackByID(userData)
 	handler, isChannelHandler := value.(ChannelHandler)
+
 	if !ok || !isChannelHandler || handler == nil {
 		return nativeStatusInvalidArgument
 	}
-	request, err := requestFromNative(*(*nativeRequest)(requestPointer))
+
+	request, err := requestFromNative(
+		*(*nativeRequest)(unsafe.Pointer(requestPointer)),
+	)
 	if err != nil {
 		return nativeStatusInvalidArgument
 	}
-	if err := handler(request, connectionID); err != nil {
+
+	if err := handler(request, uint32(connectionID)); err != nil {
 		return nativeStatusServerError
 	}
+
 	return nativeStatusOK
 }
 
 const (
-	nativeStatusOK              int32 = 0
-	nativeStatusInvalidArgument int32 = -1
-	nativeStatusServerError     int32 = -3
+	nativeStatusOK              uintptr = 0
+	nativeStatusInvalidArgument uintptr = ^uintptr(0)
+	nativeStatusServerError     uintptr = ^uintptr(2)
 )
 
 func setCallbackError(api *nativeAPI, response nativeResponse, opcode ResponseOpcode, message string) (result nativeResponse) {
